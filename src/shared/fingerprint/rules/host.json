@@ -1,0 +1,1253 @@
+{
+  "version": "rules-3",
+  "threshold": 0,
+  "patterns": {
+    "network": "cisco|juniper|aruba|ubiquiti|mikrotik|routerboard|netgear|tp-?link|d-?link|zyxel|huawei|arista|extreme networks|ruckus|meraki|cambium|draytek|edgecore|h3c|ruijie|tenda|asustek|linksys|eero|plume",
+    "firewall": "fortinet|palo alto|sonicwall|watchguard|check point|sophos|barracuda|netgate",
+    "wireless": "ruckus|aruba|cambium|ubiquiti|eero|plume",
+    "printer": "hewlett[\\s-]*packard(?![\\s-]*enterprise)|hp inc|brother|epson|canon|lexmark|xerox|ricoh|kyocera|konica|sharp|\\boki\\b",
+    "camera": "hikvision|dahua|axis comm|reolink|amcrest|uniview|hanwha|vivotek|mobotix|wyze",
+    "storage": "synology|qnap|western digital|asustor|buffalo|netapp|terramaster",
+    "iot": "espressif|tuya|shelly|allterco|raspberry|signify|philips lighting|ecobee|nest labs|ring llc|amazon technologies|sonoff|itead|xiaomi|wiz connected|lifx|meross",
+    "media": "roku|sonos|vizio|tcl|hisense|lg electronics|samsung electronics|sony|bose|nvidia",
+    "apple": "^apple",
+    "voip": "polycom|\\bpoly\\b|yealink|grandstream|snom|avaya|mitel|fanvil|htek|alcatel-lucent enterprise"
+  },
+  "rules": [
+    {
+      "id": "vm",
+      "when": {
+        "virtualMac": true
+      },
+      "type": {
+        "is": "vm",
+        "confidence": 0.85,
+        "why": "MAC belongs to a virtual machine network card"
+      }
+    },
+    {
+      "id": "onvif-camera",
+      "when": {
+        "match": {
+          "field": "onvif",
+          "pattern": "NetworkVideoTransmitter"
+        }
+      },
+      "type": {
+        "is": "camera",
+        "confidence": 0.95,
+        "why": "answers camera discovery (ONVIF)"
+      }
+    },
+    {
+      "id": "mdns-printer",
+      "when": {
+        "match": {
+          "field": "services",
+          "pattern": "^_pdl-datastream\\._tcp$"
+        }
+      },
+      "type": {
+        "is": "printer",
+        "confidence": 0.95,
+        "why": "announces a raw printing service"
+      }
+    },
+    {
+      "id": "mdns-print-service",
+      "when": {
+        "all": [
+          {
+            "match": {
+              "field": "services",
+              "pattern": "^_(ipp|ipps|printer)\\._tcp$"
+            }
+          },
+          {
+            "not": {
+              "port": [
+                22,
+                135,
+                139,
+                445,
+                548,
+                3389,
+                5900,
+                62078
+              ]
+            }
+          },
+          {
+            "not": {
+              "vendor": "@apple"
+            }
+          }
+        ]
+      },
+      "type": {
+        "is": "printer",
+        "confidence": 0.85,
+        "why": "announces printing services and no computer services"
+      }
+    },
+    {
+      "id": "upnp-printer",
+      "when": {
+        "match": {
+          "field": "upnp.deviceType",
+          "pattern": ":device:Printer:"
+        }
+      },
+      "type": {
+        "is": "printer",
+        "confidence": 0.9,
+        "why": "describes itself as a printer (UPnP)"
+      }
+    },
+    {
+      "id": "upnp-storage",
+      "when": {
+        "all": [
+          {
+            "match": {
+              "field": "upnp.manufacturer",
+              "pattern": "^(Synology|QNAP|ASUSTOR|TerraMaster|Western Digital)\\b"
+            }
+          },
+          {
+            "not": {
+              "match": {
+                "field": "upnp.deviceType",
+                "pattern": "InternetGatewayDevice|WLANAccessPoint|WFADevice"
+              }
+            }
+          },
+          {
+            "gateway": false
+          }
+        ]
+      },
+      "type": {
+        "is": "storage",
+        "confidence": 0.9,
+        "why": "describes itself as a storage device from its maker (UPnP)"
+      }
+    },
+    {
+      "id": "upnp-media",
+      "when": {
+        "all": [
+          {
+            "match": {
+              "field": "upnp.deviceType",
+              "pattern": ":device:MediaRenderer:"
+            }
+          },
+          {
+            "not": {
+              "port": [
+                22,
+                135,
+                139,
+                445,
+                548,
+                3389,
+                5900,
+                62078
+              ]
+            }
+          }
+        ]
+      },
+      "type": {
+        "is": "tv",
+        "confidence": 0.8,
+        "why": "describes itself as a media player (UPnP) and offers no computer services"
+      }
+    },
+    {
+      "id": "upnp-zone-player",
+      "when": {
+        "match": {
+          "field": "upnp.deviceType",
+          "pattern": ":device:ZonePlayer:"
+        }
+      },
+      "type": {
+        "is": "tv",
+        "confidence": 0.85,
+        "why": "describes itself as a networked speaker (UPnP)"
+      }
+    },
+    {
+      "id": "mdns-media",
+      "when": {
+        "match": {
+          "field": "services",
+          "pattern": "^_(googlecast|sonos|rdk-rics|amzn-wplay)\\._tcp$"
+        }
+      },
+      "type": {
+        "is": "tv",
+        "confidence": 0.85,
+        "why": "announces media casting services"
+      }
+    },
+    {
+      "id": "tls-signage",
+      "when": {
+        "match": {
+          "field": "tls.subject",
+          "pattern": "O=BrightSign\\b"
+        }
+      },
+      "type": {
+        "is": "tv",
+        "confidence": 0.85,
+        "why": "certificate of a digital signage player"
+      }
+    },
+    {
+      "id": "tls-server-management",
+      "when": {
+        "match": {
+          "field": "tls.subject",
+          "pattern": "idrac|Remote Access Group|Integrated Lights-Out|\\bIPMI\\b"
+        }
+      },
+      "type": {
+        "is": "server",
+        "confidence": 0.85,
+        "why": "certificate of a server management controller"
+      }
+    },
+    {
+      "id": "tls-ap-portal",
+      "when": {
+        "match": {
+          "field": "tls.subject",
+          "pattern": "aio\\.cloudauth\\.net"
+        }
+      },
+      "type": {
+        "is": "ap",
+        "confidence": 0.85,
+        "why": "certificate of an access point sign-in page"
+      }
+    },
+    {
+      "id": "web-firewall",
+      "when": {
+        "match": {
+          "field": "http.title",
+          "pattern": "\\b(pfSense|OPNsense|FortiGate|SonicWall|Sophos|WatchGuard)\\b"
+        }
+      },
+      "type": {
+        "is": "firewall",
+        "confidence": 0.85,
+        "why": "firewall management page"
+      },
+      "os": {
+        "is": "Network OS",
+        "confidence": 0.7,
+        "why": "its management page or greeting names network equipment software"
+      }
+    },
+    {
+      "id": "web-router",
+      "when": {
+        "match": {
+          "field": "http.title",
+          "pattern": "\\b(OpenWrt|LuCI|DD-WRT|EdgeOS)\\b"
+        }
+      },
+      "type": {
+        "is": "router",
+        "confidence": 0.65,
+        "why": "router firmware management page"
+      },
+      "os": {
+        "is": "Network OS",
+        "confidence": 0.7,
+        "why": "its management page or greeting names network equipment software"
+      }
+    },
+    {
+      "id": "mdns-smart-home",
+      "when": {
+        "all": [
+          {
+            "match": {
+              "field": "services",
+              "pattern": "^_(smartthings|shelly|hue|lutron|tuya|ecobee)\\._(tcp|udp)$"
+            }
+          },
+          {
+            "not": {
+              "vendor": "@apple"
+            }
+          }
+        ]
+      },
+      "type": {
+        "is": "iot",
+        "confidence": 0.75,
+        "why": "announces smart home services"
+      }
+    },
+    {
+      "id": "mdns-home-accessory",
+      "when": {
+        "all": [
+          {
+            "match": {
+              "field": "services",
+              "pattern": "^_(hap|matter|matterc)\\._(tcp|udp)$"
+            }
+          },
+          {
+            "not": {
+              "port": [
+                22,
+                53,
+                135,
+                139,
+                445,
+                548,
+                3389,
+                5900,
+                62078
+              ]
+            }
+          },
+          {
+            "not": {
+              "vendor": "@apple"
+            }
+          },
+          {
+            "not": {
+              "vendor": "@network"
+            }
+          }
+        ]
+      },
+      "type": {
+        "is": "iot",
+        "confidence": 0.6,
+        "why": "announces a home accessory service and nothing more"
+      }
+    },
+    {
+      "id": "web-smart-home",
+      "when": {
+        "match": {
+          "field": "http.server",
+          "pattern": "^(ShellyHTTP|Hue\\b)"
+        }
+      },
+      "type": {
+        "is": "iot",
+        "confidence": 0.85,
+        "why": "web server of a smart home device"
+      }
+    },
+    {
+      "id": "web-embedded",
+      "when": {
+        "match": {
+          "field": "http.server",
+          "pattern": "^(GoAhead|uc-httpd|Boa/)"
+        }
+      },
+      "type": {
+        "is": "iot",
+        "confidence": 0.5,
+        "why": "web server made for embedded devices"
+      }
+    },
+    {
+      "id": "printer-ports",
+      "group": "printer",
+      "when": {
+        "port": [
+          9100,
+          631,
+          515
+        ]
+      },
+      "type": {
+        "is": "printer",
+        "confidence": 0.9,
+        "why": "printing ports are open"
+      }
+    },
+    {
+      "id": "printer-vendor-web",
+      "group": "printer",
+      "when": {
+        "all": [
+          {
+            "vendor": "@printer"
+          },
+          {
+            "port": [
+              80,
+              443
+            ]
+          }
+        ]
+      },
+      "type": {
+        "is": "printer",
+        "confidence": 0.7,
+        "why": "printer vendor with a web page"
+      }
+    },
+    {
+      "id": "camera",
+      "when": {
+        "any": [
+          {
+            "port": [
+              554,
+              8554
+            ]
+          },
+          {
+            "vendor": "@camera"
+          }
+        ]
+      },
+      "type": {
+        "is": "camera",
+        "confidence": 0.85,
+        "why": "video streaming port or camera vendor"
+      }
+    },
+    {
+      "id": "storage",
+      "when": {
+        "any": [
+          {
+            "vendor": "@storage"
+          },
+          {
+            "all": [
+              {
+                "port": [
+                  5000
+                ]
+              },
+              {
+                "port": [
+                  5001
+                ]
+              },
+              {
+                "port": [
+                  445
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "type": {
+        "is": "storage",
+        "confidence": 0.8,
+        "why": "storage vendor or storage management ports"
+      }
+    },
+    {
+      "id": "iot",
+      "when": {
+        "any": [
+          {
+            "port": [
+              1883,
+              8883,
+              5683,
+              8123
+            ]
+          },
+          {
+            "vendor": "@iot"
+          }
+        ]
+      },
+      "type": {
+        "is": "iot",
+        "confidence": 0.65,
+        "why": "IoT protocol port or IoT vendor"
+      }
+    },
+    {
+      "id": "tv",
+      "when": {
+        "any": [
+          {
+            "port": [
+              8009
+            ]
+          },
+          {
+            "all": [
+              {
+                "vendor": "@media"
+              },
+              {
+                "not": {
+                  "port": [
+                    22,
+                    445
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "type": {
+        "is": "tv",
+        "confidence": 0.6,
+        "why": "media casting port or media vendor"
+      }
+    },
+    {
+      "id": "firewall-vendor",
+      "group": "network",
+      "when": {
+        "vendor": "@firewall"
+      },
+      "type": {
+        "is": "firewall",
+        "confidence": 0.85,
+        "why": "firewall vendor"
+      },
+      "os": {
+        "is": "Network OS",
+        "confidence": 0.6,
+        "why": "network equipment vendor"
+      }
+    },
+    {
+      "id": "network-dns",
+      "group": "network",
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "vendor": "@network"
+              },
+              {
+                "port": [
+                  8291,
+                  8728
+                ]
+              }
+            ]
+          },
+          {
+            "port": [
+              53
+            ]
+          },
+          {
+            "gateway": false
+          }
+        ]
+      },
+      "type": {
+        "is": "router",
+        "confidence": 0.8,
+        "why": "network vendor serving DNS"
+      },
+      "os": {
+        "is": "Network OS",
+        "confidence": 0.6,
+        "why": "network equipment vendor"
+      }
+    },
+    {
+      "id": "network-gateway",
+      "group": "network",
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "vendor": "@network"
+              },
+              {
+                "port": [
+                  8291,
+                  8728
+                ]
+              }
+            ]
+          },
+          {
+            "any": [
+              {
+                "gateway": true
+              },
+              {
+                "port": [
+                  53,
+                  8291,
+                  8728
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "type": {
+        "is": "router",
+        "confidence": 0.8,
+        "why": "network vendor acting as gateway"
+      },
+      "os": {
+        "is": "Network OS",
+        "confidence": 0.6,
+        "why": "network equipment vendor"
+      }
+    },
+    {
+      "id": "network-ap",
+      "group": "network",
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "vendor": "@network"
+              },
+              {
+                "port": [
+                  8291,
+                  8728
+                ]
+              }
+            ]
+          },
+          {
+            "vendor": "@wireless"
+          }
+        ]
+      },
+      "type": {
+        "is": "ap",
+        "confidence": 0.7,
+        "why": "wireless equipment vendor"
+      },
+      "os": {
+        "is": "Network OS",
+        "confidence": 0.6,
+        "why": "network equipment vendor"
+      }
+    },
+    {
+      "id": "network-switch",
+      "group": "network",
+      "when": {
+        "any": [
+          {
+            "vendor": "@network"
+          },
+          {
+            "port": [
+              8291,
+              8728
+            ]
+          }
+        ]
+      },
+      "type": {
+        "is": "switch",
+        "confidence": 0.6,
+        "why": "network vendor with management ports"
+      },
+      "os": {
+        "is": "Network OS",
+        "confidence": 0.6,
+        "why": "network equipment vendor"
+      }
+    },
+    {
+      "id": "gateway-service",
+      "group": "network",
+      "when": {
+        "all": [
+          {
+            "gateway": true
+          },
+          {
+            "port": [
+              53,
+              80,
+              443
+            ]
+          }
+        ]
+      },
+      "type": {
+        "is": "router",
+        "confidence": 0.7,
+        "why": "default gateway serving DNS or a web page"
+      }
+    },
+    {
+      "id": "apple-sync-tablet",
+      "group": "apple-sync",
+      "when": {
+        "all": [
+          {
+            "port": [
+              62078
+            ]
+          },
+          {
+            "name": "ipad"
+          }
+        ]
+      },
+      "type": {
+        "is": "tablet",
+        "confidence": 0.85,
+        "why": "device sync port used by iPhone and iPad"
+      },
+      "os": {
+        "is": "iPadOS",
+        "confidence": 0.85,
+        "why": "device sync port"
+      }
+    },
+    {
+      "id": "apple-sync-phone",
+      "group": "apple-sync",
+      "when": {
+        "port": [
+          62078
+        ]
+      },
+      "type": {
+        "is": "phone",
+        "confidence": 0.85,
+        "why": "device sync port used by iPhone and iPad"
+      },
+      "os": {
+        "is": "iOS",
+        "confidence": 0.85,
+        "why": "device sync port"
+      }
+    },
+    {
+      "id": "phone-name",
+      "when": {
+        "name": "iphone|android|galaxy|pixel"
+      },
+      "type": {
+        "is": "phone",
+        "confidence": 0.75,
+        "why": "phone-like device name"
+      }
+    },
+    {
+      "id": "voip-phone",
+      "when": {
+        "all": [
+          {
+            "port": [
+              5060,
+              5061
+            ]
+          },
+          {
+            "vendor": "@voip"
+          }
+        ]
+      },
+      "type": {
+        "is": "phone",
+        "confidence": 0.85,
+        "why": "desk phone maker answering on the SIP port"
+      }
+    },
+    {
+      "id": "windows-server-ttl",
+      "group": "windows",
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "all": [
+                  {
+                    "port": [
+                      135
+                    ]
+                  },
+                  {
+                    "port": [
+                      445
+                    ]
+                  }
+                ]
+              },
+              {
+                "port": [
+                  3389,
+                  5985
+                ]
+              }
+            ]
+          },
+          {
+            "port": [
+              1433,
+              389,
+              88
+            ]
+          },
+          {
+            "ttl": {
+              "gt": 64,
+              "max": 128
+            }
+          }
+        ]
+      },
+      "type": {
+        "is": "server",
+        "confidence": 0.75,
+        "why": "Windows RPC, file sharing or remote desktop ports"
+      },
+      "os": {
+        "is": "Windows",
+        "confidence": 0.9,
+        "why": "Windows service ports"
+      }
+    },
+    {
+      "id": "windows-server",
+      "group": "windows",
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "all": [
+                  {
+                    "port": [
+                      135
+                    ]
+                  },
+                  {
+                    "port": [
+                      445
+                    ]
+                  }
+                ]
+              },
+              {
+                "port": [
+                  3389,
+                  5985
+                ]
+              }
+            ]
+          },
+          {
+            "port": [
+              1433,
+              389,
+              88
+            ]
+          }
+        ]
+      },
+      "type": {
+        "is": "server",
+        "confidence": 0.75,
+        "why": "Windows RPC, file sharing or remote desktop ports"
+      },
+      "os": {
+        "is": "Windows",
+        "confidence": 0.75,
+        "why": "Windows service ports"
+      }
+    },
+    {
+      "id": "windows-computer-ttl",
+      "group": "windows",
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "all": [
+                  {
+                    "port": [
+                      135
+                    ]
+                  },
+                  {
+                    "port": [
+                      445
+                    ]
+                  }
+                ]
+              },
+              {
+                "port": [
+                  3389,
+                  5985
+                ]
+              }
+            ]
+          },
+          {
+            "ttl": {
+              "gt": 64,
+              "max": 128
+            }
+          }
+        ]
+      },
+      "type": {
+        "is": "computer",
+        "confidence": 0.75,
+        "why": "Windows RPC, file sharing or remote desktop ports"
+      },
+      "os": {
+        "is": "Windows",
+        "confidence": 0.9,
+        "why": "Windows service ports"
+      }
+    },
+    {
+      "id": "windows-computer",
+      "group": "windows",
+      "when": {
+        "any": [
+          {
+            "all": [
+              {
+                "port": [
+                  135
+                ]
+              },
+              {
+                "port": [
+                  445
+                ]
+              }
+            ]
+          },
+          {
+            "port": [
+              3389,
+              5985
+            ]
+          }
+        ]
+      },
+      "type": {
+        "is": "computer",
+        "confidence": 0.75,
+        "why": "Windows RPC, file sharing or remote desktop ports"
+      },
+      "os": {
+        "is": "Windows",
+        "confidence": 0.75,
+        "why": "Windows service ports"
+      }
+    },
+    {
+      "id": "apple-laptop",
+      "group": "apple-desktop",
+      "when": {
+        "all": [
+          {
+            "all": [
+              {
+                "vendor": "@apple"
+              },
+              {
+                "not": {
+                  "port": [
+                    62078
+                  ]
+                }
+              },
+              {
+                "any": [
+                  {
+                    "port": [
+                      548,
+                      7000,
+                      5900,
+                      22,
+                      445
+                    ]
+                  },
+                  {
+                    "name": "mac"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "macbook"
+          }
+        ]
+      },
+      "type": {
+        "is": "laptop",
+        "confidence": 0.75,
+        "why": "Apple device with desktop services"
+      },
+      "os": {
+        "is": "macOS",
+        "confidence": 0.75,
+        "why": "Apple device with file sharing, AirPlay or remote login"
+      }
+    },
+    {
+      "id": "apple-computer",
+      "group": "apple-desktop",
+      "when": {
+        "all": [
+          {
+            "vendor": "@apple"
+          },
+          {
+            "not": {
+              "port": [
+                62078
+              ]
+            }
+          },
+          {
+            "any": [
+              {
+                "port": [
+                  548,
+                  7000,
+                  5900,
+                  22,
+                  445
+                ]
+              },
+              {
+                "name": "mac"
+              }
+            ]
+          }
+        ]
+      },
+      "type": {
+        "is": "computer",
+        "confidence": 0.75,
+        "why": "Apple device with desktop services"
+      },
+      "os": {
+        "is": "macOS",
+        "confidence": 0.75,
+        "why": "Apple device with file sharing, AirPlay or remote login"
+      }
+    },
+    {
+      "id": "laptop-name",
+      "when": {
+        "name": "macbook|laptop|thinkpad|latitude|xps|surface|zenbook|yoga"
+      },
+      "type": {
+        "is": "laptop",
+        "confidence": 0.76,
+        "why": "laptop-like device name"
+      }
+    },
+    {
+      "id": "server-fallback",
+      "when": {
+        "all": [
+          {
+            "typeIs": "unknown"
+          },
+          {
+            "port": [
+              22
+            ]
+          },
+          {
+            "port": [
+              80,
+              443,
+              3306,
+              5432,
+              6379,
+              8080,
+              9000,
+              27017
+            ]
+          }
+        ]
+      },
+      "type": {
+        "is": "server",
+        "confidence": 0.55,
+        "why": "remote login plus web or database services"
+      }
+    },
+    {
+      "id": "ssh-network-os",
+      "when": {
+        "match": {
+          "field": "ssh",
+          "pattern": "^SSH-[\\d.]+-(Cisco|HUAWEI|Comware|NetScreen|RomSShell|ArubaOS|ROSSSH)"
+        }
+      },
+      "os": {
+        "is": "Network OS",
+        "confidence": 0.8,
+        "why": "SSH greeting names network equipment software"
+      }
+    },
+    {
+      "id": "ssh-windows",
+      "when": {
+        "match": {
+          "field": "ssh",
+          "pattern": "OpenSSH_for_Windows"
+        }
+      },
+      "os": {
+        "is": "Windows",
+        "confidence": 0.85,
+        "why": "SSH greeting names Windows"
+      }
+    },
+    {
+      "id": "ssh-linux",
+      "when": {
+        "all": [
+          {
+            "match": {
+              "field": "ssh",
+              "pattern": "\\b(Debian|Ubuntu|Raspbian|Fedora|CentOS|FreeBSD)\\b"
+            }
+          },
+          {
+            "not": {
+              "typeIs": "firewall"
+            }
+          },
+          {
+            "not": {
+              "typeIs": "router"
+            }
+          }
+        ]
+      },
+      "os": {
+        "is": "Linux / Unix-like",
+        "confidence": 0.8,
+        "why": "SSH greeting names a Linux or Unix distribution"
+      }
+    },
+    {
+      "id": "os-ttl-unix",
+      "group": "os-ttl",
+      "when": {
+        "all": [
+          {
+            "osKnown": false
+          },
+          {
+            "ttl": {
+              "gt": 0,
+              "max": 64
+            }
+          }
+        ]
+      },
+      "os": {
+        "is": "Linux / Unix-like",
+        "confidence": 0.35,
+        "why": "reply TTL {ttl} suggests a Unix-like system"
+      }
+    },
+    {
+      "id": "os-ttl-windows",
+      "group": "os-ttl",
+      "when": {
+        "all": [
+          {
+            "osKnown": false
+          },
+          {
+            "ttl": {
+              "gt": 0,
+              "max": 128
+            }
+          }
+        ]
+      },
+      "os": {
+        "is": "Windows",
+        "confidence": 0.4,
+        "why": "reply TTL {ttl} suggests Windows"
+      }
+    },
+    {
+      "id": "os-ttl-network",
+      "group": "os-ttl",
+      "when": {
+        "all": [
+          {
+            "osKnown": false
+          },
+          {
+            "ttl": {
+              "gt": 0
+            }
+          }
+        ]
+      },
+      "os": {
+        "is": "Network OS",
+        "confidence": 0.4,
+        "why": "reply TTL {ttl} suggests network equipment"
+      }
+    },
+    {
+      "id": "os-server-ssh",
+      "when": {
+        "all": [
+          {
+            "typeIs": "server"
+          },
+          {
+            "osKnown": false
+          },
+          {
+            "port": [
+              22
+            ]
+          }
+        ]
+      },
+      "os": {
+        "is": "Linux / Unix-like",
+        "confidence": 0.5,
+        "why": "remote login service"
+      }
+    }
+  ]
+}

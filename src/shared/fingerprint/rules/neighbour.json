@@ -1,0 +1,65 @@
+{
+  "version": "rules-1",
+  "rules": [
+    {
+      "id": "announced-console",
+      "group": "announced",
+      "when": {
+        "text": "ui-alpine|unifi os|dream machine|cloud gateway|\\bud[mr]\\b|\\bu[cx]g\\b"
+      },
+      "type": {
+        "is": "router",
+        "confidence": 1,
+        "why": "announces a gateway console"
+      }
+    },
+    {
+      "id": "announced-ap",
+      "group": "announced",
+      "when": {
+        "text": "access point|\\bap\\d|wi-?fi|wireless|wlan"
+      },
+      "type": {
+        "is": "ap",
+        "confidence": 1,
+        "why": "announces an access point"
+      }
+    },
+    {
+      "id": "announced-switch",
+      "group": "announced",
+      "when": {
+        "text": "switch|\\bgs\\d{3}|\\bsg\\d{3}|catalyst|procurve"
+      },
+      "type": {
+        "is": "switch",
+        "confidence": 1,
+        "why": "announces a switch"
+      }
+    },
+    {
+      "id": "announced-router",
+      "group": "announced",
+      "when": {
+        "text": "router|gateway|firewall"
+      },
+      "type": {
+        "is": "router",
+        "confidence": 1,
+        "why": "announces a router, gateway or firewall"
+      }
+    },
+    {
+      "id": "announced-phone",
+      "group": "announced",
+      "when": {
+        "text": "phone|voip"
+      },
+      "type": {
+        "is": "phone",
+        "confidence": 1,
+        "why": "announces a phone"
+      }
+    }
+  ]
+}
