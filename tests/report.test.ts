@@ -31,6 +31,20 @@ describe('reportFindings', () => {
     expect(f[1]?.affected).toEqual(['printer (10.0.0.9)', '10.0.0.10']);
     expect(f[2]?.title).toBe('DNS: Slow answers');
   });
+
+  it('lists links whose ends disagree on native VLAN or duplex as medium findings', () => {
+    const f = reportFindings([] as { ip: string; risks: [] }[], (a) => a.ip, [], [], [
+      { kind: 'nativeVlan', local: { name: 'CORE', port: 'Et0/3', value: '1' }, remote: { name: 'ACC2', port: 'Ethernet0/0', value: '30' } },
+    ]);
+    expect(f).toEqual([
+      expect.objectContaining({
+        severity: 'medium',
+        title: 'Native VLAN mismatch between CORE and ACC2',
+        affected: ['CORE Et0/3 (VLAN 1)', 'ACC2 Ethernet0/0 (VLAN 30)'],
+      }),
+    ]);
+    expect(f[0]?.detail).toContain('Set the same native VLAN on both ports');
+  });
 });
 
 describe('buildReportHtml', () => {

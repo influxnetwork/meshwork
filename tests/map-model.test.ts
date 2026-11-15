@@ -3,6 +3,7 @@ import type { Asset, DeviceType } from '@shared/types';
 import {
   placeCableLabels,
   searchMap,
+  vlanLabel,
   type MapSearchEntry, GATEWAY_ID, INTERNET_ID, MEMBER_SIZE, attachLinks, buildTopology, facingSide, findGateway, groupId, ipKey, layoutTree, memberColumns, type Box } from '../src/renderer/src/map-model';
 
 let seq = 0;
@@ -324,5 +325,34 @@ describe('placeCableLabels', () => {
 
   it('places nothing on a cable with no length', () => {
     expect(placeCableLabels(0, vertical, { src: port })).toEqual({});
+  });
+});
+
+describe('vlanLabel', () => {
+  it('shows an access port as its untagged VLAN', () => {
+    expect(vlanLabel({ pvid: 10 })).toBe('U10');
+  });
+
+  it('leaves a port on the default VLAN unlabelled', () => {
+    expect(vlanLabel({ pvid: 1 })).toBeUndefined();
+    expect(vlanLabel(undefined)).toBeUndefined();
+    expect(vlanLabel({})).toBeUndefined();
+  });
+
+  it('shows a trunk as untagged plus tagged VLANs, sorted', () => {
+    expect(vlanLabel({ pvid: 1, tagged: [99, 10, 20] })).toBe('U1 T10,20,99');
+  });
+
+  it('collapses runs of three or more tagged VLANs into a range', () => {
+    expect(vlanLabel({ pvid: 1, tagged: [10, 11, 12, 13, 20, 21, 99] })).toBe('U1 T10-13,20,21,99');
+    expect(vlanLabel({ pvid: 1, tagged: Array.from({ length: 4093 }, (_, i) => i + 2) })).toBe('U1 T2-4094');
+  });
+
+  it('shows only tagged VLANs when the untagged one is not known', () => {
+    expect(vlanLabel({ tagged: [20, 10] })).toBe('T10,20');
+  });
+
+  it('does not list the untagged VLAN again among the tagged ones', () => {
+    expect(vlanLabel({ pvid: 10, tagged: [10, 20] })).toBe('U10 T20');
   });
 });

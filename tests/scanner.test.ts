@@ -509,6 +509,20 @@ describe('inventory', () => {
     inv.close();
   });
 
+  it('adds scanned ranges to a network known by its ranges, and keeps one known by its router as it is', () => {
+    const inv = db();
+    const remote = inv.resolveNetwork({ fingerprint: 'range:198.51.100.0/24', cidr: '198.51.100.0/24', local: false });
+    const wider = inv.extendNetwork(remote.id, '203.0.113.0/30');
+    expect(wider).toMatchObject({ id: remote.id, cidr: '198.51.100.0/24, 203.0.113.0/30' });
+    // A later scan of the whole set lands in the same network; adding a range twice changes nothing.
+    expect(inv.resolveNetwork({ fingerprint: 'range:198.51.100.0/24, 203.0.113.0/30', cidr: '198.51.100.0/24, 203.0.113.0/30', local: false }).id).toBe(remote.id);
+    expect(inv.extendNetwork(remote.id, '203.0.113.0/30')?.cidr).toBe('198.51.100.0/24, 203.0.113.0/30');
+    const local = inv.resolveNetwork(home);
+    expect(inv.extendNetwork(local.id, '203.0.113.0/30')?.cidr).toBe(home.cidr);
+    expect(inv.extendNetwork('missing', '203.0.113.0/30')).toBeUndefined();
+    inv.close();
+  });
+
   it('adopts a subnet-only network once its router is identified, and renames and removes networks', () => {
     const inv = db();
     const first = inv.resolveNetwork({ fingerprint: 'subnet:192.0.2.0/24', cidr: '192.0.2.0/24', local: true });

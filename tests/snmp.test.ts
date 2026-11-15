@@ -94,6 +94,7 @@ describe('SNMP decoding', () => {
     ]);
     expect(d.neighbors).toEqual([
       {
+        protocols: ['lldp'],
         localIfIndex: 102,
         localPort: 'gi2',
         chassisMac: 'aa:00:00:00:00:02',
@@ -184,6 +185,17 @@ describe('traffic between counter readings', () => {
     // The next refresh is measured from the last reading that changed, over the whole span.
     const refreshed = advanceTraffic(cached, reading(12_000, [1, 13_000, 6000]));
     expect(refreshed.rates.get(1)).toEqual({ inBps: 8000, outBps: 0 });
+  });
+
+  it('keeps the last rate of a port whose counters were not refreshed while other ports were', () => {
+    // Switches refresh each port's counters on their own schedule.
+    const first = advanceTraffic(undefined, reading(0, [1, 0, 0], [2, 0, 0]));
+    const both = advanceTraffic(first, reading(5000, [1, 5000, 0], [2, 5000, 0]));
+    const one = advanceTraffic(both, reading(10_000, [1, 10_000, 0], [2, 5000, 0]));
+    expect(one.rates.get(1)).toEqual({ inBps: 8000, outBps: 0 });
+    expect(one.rates.get(2)).toEqual({ inBps: 8000, outBps: 0 });
+    const caught = advanceTraffic(one, reading(15_000, [1, 15_000, 0], [2, 15_000, 0]));
+    expect(caught.rates.get(2)).toEqual({ inBps: 8000, outBps: 0 });
   });
 
   it('reads unchanged counters as idle once they stay the same for too long', () => {
@@ -455,6 +467,29 @@ describe('map with a router that has several interfaces', () => {
     expect(edge(gw.id, 'net:10.7.20.0/24')).toMatchObject({ sourcePort: 'opt1', traffic: { ip: '10.7.0.1', ifIndex: 3 } });
     expect(topo.nodes.some((n) => n.id.startsWith('net:127.'))).toBe(false);
   });
+
+  it('puts VLAN subinterfaces on the cable of their physical port instead of drawing them apart', () => {
+    const r = { ...devices[0]!, interfaces: [...devices[0]!.interfaces, iface(4, 'lan0.10'), iface(5, 'lan0.20'), iface(6, 'opt1.30')] };
+    r.addresses = [...devices[0]!.addresses!, { ip: '10.7.10.1', prefix: 24, ifIndex: 4 }, { ip: '10.7.20.1', prefix: 24, ifIndex: 5 }, { ip: '10.7.30.1', prefix: 24, ifIndex: 6 }];
+    r.addresses = r.addresses.filter((a) => a.ifIndex !== 3);
+    const t = buildTopology({ gatewayIp: '10.7.0.1', gatewayMac: 'cc:00:00:00:00:01' }, [gw, sw], { clients: true, collapsed: new Set() }, { ...snapshot, devices: [r, devices[1]!] });
+    const routes = [
+      { vlan: 10, network: '10.7.10.0/24', ip: '10.7.10.1', port: 'lan0.10' },
+      { vlan: 20, network: '10.7.20.0/24', ip: '10.7.20.1', port: 'lan0.20' },
+    ];
+    expect(t.nodes.some((n) => n.id === 'net:10.7.10.0/24' || n.id === 'net:10.7.20.0/24')).toBe(false);
+    expect(t.edges.find((e) => e.source === gw.id && e.target === sw.id)).toMatchObject({ sourcePort: 'lan0', routes });
+    expect(t.nodes.find((n) => n.id === gw.id)?.routes).toEqual(routes);
+    // A subinterface on a port with no cable seen stays a network of its own.
+    expect(t.nodes.some((n) => n.id === 'net:10.7.30.0/24')).toBe(true);
+  });
+
+  it('puts the network of a port where a neighbour is heard on that cable, not apart', () => {
+    const heard = { localIfIndex: 3, localPort: 'opt1', sysName: 'lab-sw', chassisId: 'lab-sw', mgmtIp: '10.7.20.9', protocols: ['cdp' as const] };
+    const t = buildTopology({ gatewayIp: '10.7.0.1', gatewayMac: 'cc:00:00:00:00:01' }, [gw, sw], { clients: true, collapsed: new Set() }, { ...snapshot, devices: [{ ...devices[0]!, neighbors: [heard] }, devices[1]!] });
+    expect(t.nodes.some((n) => n.id === 'net:10.7.20.0/24')).toBe(false);
+    expect(t.edges.find((e) => e.source === gw.id && e.sourcePort === 'opt1')?.routes).toEqual([{ vlan: undefined, network: '10.7.20.0/24', ip: '10.7.20.1', port: 'opt1' }]);
+  });
 });
 
 describe('map of a remote network read over SNMP', () => {
@@ -668,6 +703,57 @@ describe('redundant links between switches', () => {
   it('draws no redundant links when the gear forms a plain tree', () => {
     const tree = buildTopology({}, [r1, sw1, sw2], { clients: true, collapsed: new Set() }, { ...snapshot, devices: devices.slice(0, 2).map((d) => ({ ...d, neighbors: d.neighbors.filter((n) => n.sysName !== 'SW3') })) });
     expect(tree.redundant ?? []).toEqual([]);
+  });
+});
+
+describe('parallel cables between two switches', () => {
+  const r1 = asset('192.168.100.1', 'router');
+  const core = asset('192.168.100.2', 'switch');
+  const acc = asset('192.168.100.3', 'switch');
+  const port = (ifIndex: number, name: string, stp?: 'blocking' | 'forwarding') => ({ ifIndex, name, up: true, stp });
+  const nb = (localIfIndex: number, localPort: string, mgmtIp: string, sysName: string, remotePort: string) => ({ localIfIndex, localPort, mgmtIp, sysName, remotePort });
+  const gear = (ip: string, sysName: string, interfaces: ReturnType<typeof port>[], neighbors: ReturnType<typeof nb>[]) => ({
+    ip,
+    sysName,
+    forwarding: true,
+    defaultRoute: { nextHop: '192.168.100.1' },
+    interfaces,
+    neighbors,
+    fdb: [],
+    arp: [],
+  });
+  // CORE Et0/1 to ACC Et0/0 and CORE Et0/2 to ACC Et0/1; spanning tree blocks ACC Et0/1. ACC names
+  // CORE's ports the long way (as CDP does).
+  const devices = [
+    gear('192.168.100.2', 'CORE', [port(1, 'Et0/0'), port(2, 'Et0/1'), port(3, 'Et0/2')], [
+      nb(1, 'Et0/0', '192.168.100.1', 'R1', 'Et0/0'),
+      nb(2, 'Et0/1', '192.168.100.3', 'ACC', 'Et0/0'),
+      nb(3, 'Et0/2', '192.168.100.3', 'ACC', 'Et0/1'),
+    ]),
+    gear('192.168.100.3', 'ACC', [port(1, 'Et0/0', 'forwarding'), port(2, 'Et0/1', 'blocking')], [
+      nb(1, 'Et0/0', '192.168.100.2', 'CORE', 'Ethernet0/1'),
+      nb(2, 'Et0/1', '192.168.100.2', 'CORE', 'Ethernet0/2'),
+    ]),
+  ];
+  const snapshot: GearSnapshot = { networkId: 'n', collectedAt: '2026-11-14T00:00:00Z', probed: 3, devices };
+  const topo = buildTopology({}, [r1, core, acc], { clients: true, collapsed: new Set() }, snapshot);
+
+  it('draws each cable on its own, the one spanning tree blocks as redundant', () => {
+    const tree = topo.edges.filter((e) => e.source === core.id && e.target === acc.id);
+    expect(tree).toHaveLength(1);
+    expect(tree[0]).toMatchObject({ sourcePort: 'Et0/1', targetPort: 'Et0/0' });
+    expect(topo.redundant).toHaveLength(1);
+    const r = topo.redundant![0]!;
+    const portOf = (id: string) => (r.source === id ? r.sourcePort : r.targetPort);
+    expect(portOf(core.id)).toBe('Et0/2');
+    expect(portOf(acc.id)).toBe('Et0/1');
+    expect(r).toMatchObject({ stp: 'blocked', blockedPort: { node: acc.id, port: 'Et0/1' } });
+  });
+
+  it('draws both cables when only one side reports them', () => {
+    const one = buildTopology({}, [r1, core, acc], { clients: true, collapsed: new Set() }, { ...snapshot, devices: [devices[0]!, { ...devices[1]!, neighbors: [] }] });
+    expect(one.edges.filter((e) => e.source === core.id && e.target === acc.id)).toHaveLength(1);
+    expect(one.redundant).toHaveLength(1);
   });
 });
 
@@ -891,5 +977,190 @@ describe('ARP entries from the newer IP-MIB table', () => {
       ],
     };
     expect(parseGear('10.9.0.250', w).arp).toEqual([{ ip: '10.9.0.1', mac: 'aa:00:00:00:00:01' }]);
+  });
+});
+
+describe('CDP neighbours', () => {
+  /** CDP cache rows, indexed by local ifIndex and device index. */
+  const cdp = (ifIndex: number, dev: number, cols: Record<number, unknown>) =>
+    Object.entries(cols).map(([c, v]) => vb(`${OID.cdpCache}.${c}.${ifIndex}.${dev}`, v));
+  const caps = (bits: number) => Buffer.from([bits >>> 24, (bits >>> 16) & 0xff, (bits >>> 8) & 0xff, bits & 0xff]);
+  const router = (ifIndex = 103) =>
+    cdp(ifIndex, 7, {
+      3: 1,
+      4: Buffer.from([10, 9, 0, 10]),
+      5: Buffer.from('Cisco IOS Software, Linux Software (I86BI_LINUX-ADVENTERPRISEK9-M), Version 15.4'),
+      6: Buffer.from('edge-r2'),
+      7: Buffer.from('Ethernet0/0'),
+      8: Buffer.from('Linux Unix'),
+      9: caps(0x01 | 0x20),
+      11: 99,
+      12: 3,
+    });
+
+  it('reads a neighbour announced only over CDP on the port it was heard on', () => {
+    const w = walks();
+    w.cdpCache = router();
+    const n = parseGear('10.9.0.250', w).neighbors.find((x) => x.protocols?.includes('cdp'));
+    expect(n).toMatchObject({
+      localIfIndex: 103,
+      localPort: 'gi3',
+      sysName: 'edge-r2',
+      mgmtIp: '10.9.0.10',
+      remotePort: 'Ethernet0/0',
+      platform: 'Linux Unix',
+      capabilities: ['router'],
+      nativeVlan: 99,
+      duplex: 'full',
+      protocols: ['cdp'],
+    });
+    expect(n?.sysDescr).toContain('Version 15.4');
+  });
+
+  it('marks LLDP neighbours with the protocol they came from', () => {
+    expect(parseGear('10.9.0.250', walks()).neighbors[0]?.protocols).toEqual(['lldp']);
+  });
+
+  it('drops the serial number some devices append to their CDP device ID', () => {
+    const w = walks();
+    w.cdpCache = cdp(103, 1, { 6: Buffer.from('dc-core-01(FDO21120ABC)'), 9: caps(0x08) });
+    expect(parseGear('10.9.0.250', w).neighbors.find((x) => x.localIfIndex === 103)?.sysName).toBe('dc-core-01');
+  });
+
+  it('maps CDP capabilities to the LLDP ones the map already understands', () => {
+    const w = walks();
+    w.cdpCache = [
+      ...cdp(103, 1, { 6: Buffer.from('access-sw'), 9: caps(0x08 | 0x20) }),
+      ...cdp(104, 2, { 6: Buffer.from('SEP0011220000AA'), 9: caps(0x80 | 0x10) }),
+      ...cdp(101, 3, { 6: Buffer.from('lobby-wap'), 9: caps(0x02) }),
+      // Routers announce source-route bridging next to routing; that does not make them switches.
+      ...cdp(101, 4, { 6: Buffer.from('edge-r1'), 9: caps(0x01 | 0x04) }),
+    ];
+    const byName = new Map(parseGear('10.9.0.250', w).neighbors.map((n) => [n.sysName, n.capabilities]));
+    expect(byName.get('access-sw')).toEqual(['bridge']);
+    expect(byName.get('SEP0011220000AA')).toEqual(['telephone', 'station']);
+    expect(byName.get('lobby-wap')).toEqual(['bridge']);
+    expect(byName.get('edge-r1')).toEqual(['router']);
+  });
+
+  it('keeps one neighbour when a device announces itself over both LLDP and CDP', () => {
+    const w = walks();
+    w.cdpCache = cdp(102, 4, {
+      3: 1,
+      4: Buffer.from([10, 9, 0, 2]),
+      6: Buffer.from('lobby-ap.example.net'),
+      7: Buffer.from('GigabitEthernet0'),
+      8: Buffer.from('cisco AIR-AP-EXAMPLE'),
+      11: 1,
+    });
+    const onPort = parseGear('10.9.0.250', w).neighbors.filter((n) => n.localIfIndex === 102);
+    expect(onPort).toHaveLength(1);
+    // LLDP's own reading is kept; CDP adds what LLDP does not carry.
+    expect(onPort[0]).toMatchObject({ sysName: 'lobby-ap', remotePort: 'eth0', platform: 'cisco AIR-AP-EXAMPLE', nativeVlan: 1, protocols: ['lldp', 'cdp'] });
+  });
+
+  it('joins CDP with the LLDP entry for the same remote port, and keeps the capabilities of both', () => {
+    const w = walks();
+    // A router announces itself over LLDP once per subinterface; CDP names its physical port.
+    const lldp = (entry: number, port: string) => [
+      vb(`${OID.lldpRem}.7.0.103.${entry}`, Buffer.from(port)),
+      vb(`${OID.lldpRem}.9.0.103.${entry}`, Buffer.from('edge-r1')),
+      vb(`${OID.lldpRem}.12.0.103.${entry}`, Buffer.from([0x08])),
+    ];
+    w.lldpRem.push(...lldp(2, 'Gi0/0.20'), ...lldp(3, 'Gi0/0'));
+    w.cdpCache = cdp(103, 9, { 6: Buffer.from('edge-r1'), 7: Buffer.from('GigabitEthernet0/0'), 9: caps(0x01 | 0x08), 12: 3 });
+    const onPort = parseGear('10.9.0.250', w).neighbors.filter((n) => n.localIfIndex === 103);
+    expect(onPort).toHaveLength(2);
+    expect(onPort.find((n) => n.remotePort === 'Gi0/0')).toMatchObject({ protocols: ['lldp', 'cdp'], duplex: 'full', capabilities: ['bridge', 'router'] });
+    expect(onPort.find((n) => n.remotePort === 'Gi0/0.20')?.protocols).toEqual(['lldp']);
+  });
+
+  it('keeps two different devices on one port as two neighbours', () => {
+    const w = walks();
+    w.cdpCache = cdp(102, 4, { 3: 1, 4: Buffer.from([10, 9, 0, 77]), 6: Buffer.from('desk-phone') });
+    expect(parseGear('10.9.0.250', w).neighbors.filter((n) => n.localIfIndex === 102)).toHaveLength(2);
+  });
+
+  it('draws a device heard only over CDP on its switch port, typed from what it announces', () => {
+    const w = walks();
+    w.cdpCache = router();
+    const snapshot: GearSnapshot = { networkId: 'n', collectedAt: '2026-01-01T00:00:00Z', probed: 2, devices: [parseGear('10.9.0.250', w)] };
+    const gw = asset('10.9.0.1', 'router', 'aa:00:00:00:00:01');
+    const sw = asset('10.9.0.250', 'switch', 'aa:00:00:00:00:99');
+    const topo = buildTopology({ gatewayIp: '10.9.0.1', gatewayMac: 'aa:00:00:00:00:01' }, [gw, sw], { clients: true, collapsed: new Set() }, snapshot);
+    const node = topo.nodes.find((n) => n.label === 'edge-r2');
+    expect(node).toMatchObject({ ip: '10.9.0.10', deviceType: 'router', announced: true, announcedVia: 'CDP' });
+    expect(topo.edges.find((e) => e.source === sw.id && e.target === node?.id)).toMatchObject({ inferred: false, sourcePort: 'gi3', targetPort: 'Eth0/0' });
+  });
+
+  it("reads each port's duplex", () => {
+    const w = walks();
+    w.dot3Duplex = [vb(`${OID.dot3Duplex}.101`, 3), vb(`${OID.dot3Duplex}.103`, 2), vb(`${OID.dot3Duplex}.104`, 1)];
+    const d = parseGear('10.9.0.250', w);
+    expect(d.interfaces.find((i) => i.ifIndex === 101)?.duplex).toBe('full');
+    expect(d.interfaces.find((i) => i.ifIndex === 103)?.duplex).toBe('half');
+    expect(d.interfaces.find((i) => i.ifIndex === 104)?.duplex).toBeUndefined();
+  });
+});
+
+describe('VLANs from Cisco tables', () => {
+  /** A switch that publishes no 802.1Q tables: VLANs come from VTP and VLAN membership. */
+  const cisco = (): GearWalks => {
+    const w = walks();
+    w.vlanStaticName = [];
+    w.vlanStaticEgress = [];
+    w.vlanStaticUntagged = [];
+    w.vlanCurrentEgress = [];
+    w.vlanCurrentUntagged = [];
+    w.pvid = [];
+    // VLANs 1, 10, 20 and 99, plus the legacy ones every Cisco switch lists.
+    w.ciscoVlanName = [
+      [1, 'default'],
+      [10, 'USERS'],
+      [20, 'VOICE'],
+      [99, 'MGMT'],
+      [1002, 'fddi-default'],
+      [1005, 'trnet-default'],
+    ].map(([v, n]) => vb(`${OID.ciscoVlanName}.1.${v}`, Buffer.from(String(n))));
+    // gi1 trunks with native VLAN 1 and allows everything; gi2 trunks with native 99 and allows 10, 20 and 99.
+    const all = Buffer.alloc(128, 0xff);
+    const some = Buffer.alloc(128);
+    some[1] = 0x20; // VLAN 10
+    some[2] = 0x08; // VLAN 20
+    some[12] = 0x10; // VLAN 99
+    w.ciscoTrunkStatus = [vb(`${OID.ciscoTrunkStatus}.101`, 1), vb(`${OID.ciscoTrunkStatus}.102`, 1), vb(`${OID.ciscoTrunkStatus}.103`, 2), vb(`${OID.ciscoTrunkStatus}.104`, 2)];
+    w.ciscoTrunkNative = [vb(`${OID.ciscoTrunkNative}.101`, 1), vb(`${OID.ciscoTrunkNative}.102`, 99), vb(`${OID.ciscoTrunkNative}.103`, 1), vb(`${OID.ciscoTrunkNative}.104`, 1)];
+    w.ciscoTrunkVlans = [vb(`${OID.ciscoTrunkVlans1k}.101`, all), vb(`${OID.ciscoTrunkVlans1k}.102`, some), vb(`${OID.ciscoTrunkVlans2k}.101`, all)];
+    // gi3 is an access port in VLAN 10; gi4 in VLAN 20.
+    w.ciscoAccessVlan = [vb(`${OID.ciscoAccessVlan}.103`, 10), vb(`${OID.ciscoAccessVlan}.104`, 20)];
+    return w;
+  };
+
+  it('reads VLAN names without the legacy VLANs', () => {
+    expect(parseGear('10.9.0.250', cisco()).vlans).toEqual([
+      { id: 1, name: 'default' },
+      { id: 10, name: 'USERS' },
+      { id: 20, name: 'VOICE' },
+      { id: 99, name: 'MGMT' },
+    ]);
+  });
+
+  it('reads trunks as native plus the allowed VLANs that exist on the switch, and access ports as their VLAN', () => {
+    const d = parseGear('10.9.0.250', cisco());
+    expect(d.interfaces.map((i) => [i.name, i.pvid, i.tagged])).toEqual([
+      ['gi1', 1, [10, 20, 99]],
+      ['gi2', 99, [10, 20]],
+      ['gi3', 10, undefined],
+      ['gi4', 20, undefined],
+    ]);
+  });
+
+  it('is not used when the switch publishes the 802.1Q tables', () => {
+    const w = walks();
+    w.ciscoVlanName = [vb(`${OID.ciscoVlanName}.1.300`, Buffer.from('OTHER'))];
+    w.ciscoAccessVlan = [vb(`${OID.ciscoAccessVlan}.103`, 300)];
+    const d = parseGear('10.9.0.250', w);
+    expect(d.vlans?.map((v) => v.id)).toEqual([1, 69]);
+    expect(d.interfaces.find((i) => i.name === 'gi3')?.pvid).toBe(69);
   });
 });

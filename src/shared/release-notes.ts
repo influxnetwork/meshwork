@@ -6,6 +6,18 @@ export interface ReleaseNote {
 
 export const RELEASE_NOTES: ReleaseNote[] = [
   {
+    version: '0.5.21',
+    notes: [
+      'Cisco neighbours: devices announced over CDP are drawn alongside those announced over LLDP, with their name, address, platform and type. A link whose two ends disagree on native VLAN or duplex raises a warning on the map and a finding in the report.',
+      'VLAN labels on cables use switch notation: U10 for an access port, U1 T10,20,99 for a trunk. Cisco switches that publish VLANs only in their own tables now show them, and two cables between the same switches are drawn separately.',
+      'The map follows each router’s default route to find the ways out. A network with several sites draws each router with its own internet, side by side and joined by their link or tunnel; a site that leaves through another hangs from it. A firewall or modem that is not managed heads the map when the scan found it, and is named as the upstream next hop when it did not.',
+      'A router’s VLAN subinterfaces are shown on their cable and as VLAN chips on the router, instead of as separate networks. Devices with no known switch port stay with the router of their network, and choosing a VLAN highlights the router, cables and devices that belong to it.',
+      'Networks the routers hold that were not scanned are listed beside the map with a Scan button, which adds what is found to the same network. The computer running Meshwork is marked “You are here”.',
+      'The map legend floats over the canvas, and live traffic no longer pauses on ports whose counters refresh at different times.',
+      'Deleting a network while a scan was saving devices to it no longer stops the app with an error: the network cannot be deleted until the scan ends.',
+    ],
+  },
+  {
     version: '0.5.20',
     notes: [
       'Loops on the map: a second cable between switches is drawn as a redundant link, dotted, with what spanning tree does on it and which port it blocks. A ring with no blocked port raises a warning.',

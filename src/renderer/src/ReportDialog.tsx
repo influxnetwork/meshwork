@@ -8,6 +8,7 @@ import * as Dialog from '@radix-ui/react-dialog';
 import { Eye, FileDown, ImagePlus, Trash2 } from 'lucide-react';
 import type { Asset, GearSnapshot, Network, Severity } from '@shared/types';
 import { findLoops } from '@shared/loops';
+import { findLinkMismatches } from '@shared/link-mismatch';
 import {
   buildReportHtml,
   inCidr,
@@ -246,7 +247,8 @@ export function ReportDialog({
     return c && inCidr(c.address, network.cidr) ? c : undefined;
   }, [open, network.cidr]);
   const loops = useMemo(() => findLoops(gear?.networkId === network.id ? gear.devices : []), [gear, network.id]);
-  const findings = useMemo(() => reportFindings(members, displayName, loops, connectivity?.checks), [members, loops, connectivity]);
+  const mismatches = useMemo(() => findLinkMismatches(gear?.networkId === network.id ? gear.devices : []), [gear, network.id]);
+  const findings = useMemo(() => reportFindings(members, displayName, loops, connectivity?.checks, mismatches), [members, loops, connectivity, mismatches]);
   const sections = connectivity ? opts.sections : opts.sections.filter((s) => s !== 'connectivity');
 
   const note: Partial<Record<ReportSection, string>> = {

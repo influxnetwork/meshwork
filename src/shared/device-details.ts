@@ -28,8 +28,8 @@ export interface DeviceDetailsInput {
   fingerprint?: string;
   /** Evidence from the identify phase. */
   observed?: Observed;
-  /** What the device reports over SNMP or announces over LLDP. */
-  gear?: { source: 'snmp' | 'lldp'; name?: string; description?: string };
+  /** What the device reports over SNMP or announces over LLDP or CDP. */
+  gear?: { source: 'snmp' | 'lldp' | 'cdp'; name?: string; description?: string };
   connection?: { path: string; switchName?: string; switchPort?: string; vlan?: number; poeWatts?: number; confirmed: boolean };
   /** Where the map learned about a device that is not in the inventory. */
   note?: string;
@@ -70,7 +70,7 @@ export function deviceDetailsText(d: DeviceDetailsInput): string {
     row('Open ports', d.ports.length ? d.ports.map((p) => (p.service ? `${p.port}/${p.service}` : String(p.port))).join(', ') : 'none found');
   if (d.gear) {
     const { model, firmware } = parseDeviceModel(d.gear.description);
-    const via = d.gear.source === 'snmp' ? 'SNMP' : 'LLDP';
+    const via = d.gear.source.toUpperCase();
     row(`Name over ${via}`, d.gear.name);
     row('Model', model);
     row('Firmware', firmware);

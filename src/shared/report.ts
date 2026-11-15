@@ -7,6 +7,7 @@ import type { Asset, DeviceType, Severity } from './types';
 import type { PublicAddress } from './diagnose';
 import type { NetworkLoop } from './loops';
 import { describeLoop } from './loops';
+import { type LinkMismatch, type MismatchEnd, describeEnd, mismatchAdvice } from './link-mismatch';
 
 /** The technician's branding, saved once and reused for every report. */
 export interface ReportBranding {
@@ -105,8 +106,18 @@ export function reportFindings<A extends Pick<Asset, 'ip' | 'risks'>>(
   name: (a: A) => string,
   loops: NetworkLoop[] = [],
   checks: ReportCheck[] = [],
+  mismatches: LinkMismatch[] = [],
 ): ReportFinding[] {
   const out: ReportFinding[] = [];
+  for (const m of mismatches) {
+    const who = (e: MismatchEnd) => e.name ?? e.ip ?? 'unknown device';
+    out.push({
+      severity: 'medium',
+      title: `${m.kind === 'nativeVlan' ? 'Native VLAN' : 'Duplex'} mismatch between ${who(m.local)} and ${who(m.remote)}`,
+      detail: mismatchAdvice(m.kind),
+      affected: [describeEnd(m.kind, m.local), describeEnd(m.kind, m.remote)],
+    });
+  }
   for (const loop of loops) {
     out.push({
       severity: 'high',

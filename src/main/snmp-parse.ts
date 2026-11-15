@@ -3,7 +3,7 @@
  * addresses and PoE state. Inputs are the raw varbinds of each walk (OID and value); values may be
  * numbers, bigints, strings or byte buffers, as SNMP libraries return them.
  */
-import type { GearDevice, GearFdbEntry, GearInterface, GearNeighbor, LldpCapability, StpState } from '@shared/types';
+import type { Duplex, GearDevice, GearFdbEntry, GearInterface, GearNeighbor, LldpCapability, StpState } from '@shared/types';
 
 export interface Varbind {
   oid: string;
@@ -56,6 +56,24 @@ export const OID = {
   lldpLocPortId: '1.0.8802.1.1.2.1.3.7.1.3',
   lldpRem: '1.0.8802.1.1.2.1.4.1.1',
   lldpRemManAddr: '1.0.8802.1.1.2.1.4.2.1.3',
+  /** CDP neighbour cache (CISCO-CDP-MIB cdpCacheEntry), indexed by local ifIndex and device index. */
+  cdpCache: '1.3.6.1.4.1.9.9.23.1.2.1.1',
+  /**
+   * Cisco VLAN tables, for switches without 802.1Q tables: VLAN names (CISCO-VTP-MIB, indexed by
+   * management domain and VLAN), per-port trunking state, native VLAN and allowed VLANs (bitmaps of
+   * VLANs 0-1023, 1024-2047, 2048-3071 and 3072-4095), and the VLAN of access ports
+   * (CISCO-VLAN-MEMBERSHIP-MIB). All but the names are indexed by ifIndex.
+   */
+  ciscoVlanName: '1.3.6.1.4.1.9.9.46.1.3.1.1.4',
+  ciscoTrunkStatus: '1.3.6.1.4.1.9.9.46.1.6.1.1.14',
+  ciscoTrunkNative: '1.3.6.1.4.1.9.9.46.1.6.1.1.5',
+  ciscoTrunkVlans1k: '1.3.6.1.4.1.9.9.46.1.6.1.1.4',
+  ciscoTrunkVlans2k: '1.3.6.1.4.1.9.9.46.1.6.1.1.17',
+  ciscoTrunkVlans3k: '1.3.6.1.4.1.9.9.46.1.6.1.1.18',
+  ciscoTrunkVlans4k: '1.3.6.1.4.1.9.9.46.1.6.1.1.19',
+  ciscoAccessVlan: '1.3.6.1.4.1.9.9.68.1.2.2.1.2',
+  /** Negotiated duplex of each interface (EtherLike-MIB dot3StatsDuplexStatus). */
+  dot3Duplex: '1.3.6.1.2.1.10.7.2.1.19',
   pethPortDetection: '1.3.6.1.2.1.105.1.1.1.6',
   pethMain: '1.3.6.1.2.1.105.1.3.1.1',
   /** Per-port PoE output power in milliwatts, published by Cisco small-business switches. */
@@ -112,6 +130,39 @@ function lldpCapabilities(v: unknown): LldpCapability[] | undefined {
   const set = LLDP_CAPABILITIES.filter((_, i) => first & (0x80 >> i));
   return set.length ? set : undefined;
 }
+
+/**
+ * CDP capability bits (cdpCacheCapabilities) and the LLDP capability each one means. Source-route
+ * bridging (0x04) is left out: routers announce it, so it does not mean the device is a switch.
+ */
+const CDP_CAPABILITIES: readonly [number, LldpCapability][] = [
+  [0x80, 'telephone'],
+  [0x01, 'router'],
+  [0x02, 'bridge'], // transparent bridge
+  [0x08, 'bridge'], // switch
+  [0x40, 'repeater'],
+  [0x10, 'station'], // host
+];
+
+/** LLDP capabilities for a CDP capability value (four bytes, big-endian); undefined when none apply. */
+function cdpCapabilities(v: unknown): LldpCapability[] | undefined {
+  const bits = Buffer.isBuffer(v) && v.length === 4 ? v.readUInt32BE(0) : num(v);
+  if (bits === undefined) return undefined;
+  const set = [...new Set(CDP_CAPABILITIES.filter(([bit]) => bits & bit).map(([, cap]) => cap))];
+  return set.length ? set : undefined;
+}
+
+/** Duplex from dot3StatsDuplexStatus or cdpCacheDuplex (both: 2 half, 3 full). */
+function duplexOf(v: unknown): Duplex | undefined {
+  const n = num(v);
+  return n === 2 ? 'half' : n === 3 ? 'full' : undefined;
+}
+
+/** Port name for matching long and short forms alike: "GigabitEthernet0/1" and "Gi0/1" both become "gi0/1". */
+const portKey = (name?: string) => name?.toLowerCase().replace(/^([a-z]{2})[a-z-]*\s*(?=\d)/, '$1') || undefined;
+
+/** Host name for matching: lower case, without the domain or a trailing "(serial)" CDP adds. */
+const hostKey = (name?: string) => name?.replace(/\(.*\)$/, '').split('.')[0]?.toLowerCase() || undefined;
 
 /** dot1dStpPortState values, by number. */
 const STP_STATES: readonly (StpState | undefined)[] = [undefined, 'disabled', 'blocking', 'listening', 'learning', 'forwarding', 'broken'];
@@ -183,6 +234,16 @@ export interface GearWalks {
   lldpLocPortId: Varbind[];
   lldpRem: Varbind[];
   lldpRemManAddr: Varbind[];
+  cdpCache?: Varbind[];
+  /** Cisco VLAN tables, read only when the device publishes no 802.1Q VLAN tables. */
+  ciscoVlanName?: Varbind[];
+  ciscoTrunkStatus?: Varbind[];
+  ciscoTrunkNative?: Varbind[];
+  /** All four allowed-VLAN bitmap columns. */
+  ciscoTrunkVlans?: Varbind[];
+  ciscoAccessVlan?: Varbind[];
+  /** Read only when the device has CDP neighbours, whose duplex it is compared with. */
+  dot3Duplex?: Varbind[];
   pethPortDetection: Varbind[];
   pethMain: Varbind[];
   poePortMilliwatts: Varbind[];
@@ -318,7 +379,67 @@ export function parseGear(ip: string, w: GearWalks): GearDevice {
       sysDescr: text(cols.get(10)),
       mgmtIp: mgmt.get(key),
       capabilities: lldpCapabilities(cols.get(12)),
+      protocols: ['lldp'],
     });
+  }
+
+  // CDP neighbours. A device heard on both protocols on the same port (same address or host name)
+  // stays one neighbour: LLDP's reading is kept and CDP adds platform, native VLAN and duplex.
+  const cdpRows = new Map<string, Map<number, unknown>>();
+  for (const vb of w.cdpCache ?? []) {
+    const idx = suffix(vb.oid, OID.cdpCache);
+    if (!idx || idx.length !== 3) continue;
+    const key = `${idx[1]}.${idx[2]}`;
+    if (!cdpRows.has(key)) cdpRows.set(key, new Map());
+    cdpRows.get(key)?.set(idx[0] as number, vb.value);
+  }
+  for (const [key, cols] of cdpRows) {
+    const ifIndex = Number(key.split('.')[0]);
+    const local = byIndex.get(ifIndex);
+    const addr = cols.get(4);
+    const mgmtIp = num(cols.get(3)) === 1 && Buffer.isBuffer(addr) && addr.length === 4 ? [...addr].join('.') : undefined;
+    const sysName = text(cols.get(6))?.replace(/\(.*\)$/, '') || undefined;
+    const heard: GearNeighbor = {
+      localIfIndex: local?.ifIndex ?? ifIndex,
+      localPort: local?.name ?? `if${ifIndex}`,
+      chassisId: sysName,
+      remotePort: text(cols.get(7)),
+      sysName,
+      sysDescr: text(cols.get(5)),
+      mgmtIp,
+      capabilities: cdpCapabilities(cols.get(9)),
+      platform: text(cols.get(8)),
+      nativeVlan: num(cols.get(11)) || undefined,
+      duplex: duplexOf(cols.get(12)),
+      protocols: ['cdp'],
+    };
+    const candidates = neighbors.filter(
+      (n) =>
+        n.localIfIndex === heard.localIfIndex &&
+        n.protocols?.length === 1 &&
+        n.protocols[0] === 'lldp' &&
+        ((!!mgmtIp && n.mgmtIp === mgmtIp) || (!!hostKey(sysName) && hostKey(n.sysName) === hostKey(sysName))),
+    );
+    // A device that announces itself over LLDP once per subinterface is joined on its physical port.
+    const same = candidates.find((n) => portKey(n.remotePort) === portKey(heard.remotePort)) ?? candidates[0];
+    if (!same) {
+      neighbors.push(heard);
+      continue;
+    }
+    same.protocols = ['lldp', 'cdp'];
+    same.platform ??= heard.platform;
+    same.nativeVlan ??= heard.nativeVlan;
+    same.duplex ??= heard.duplex;
+    same.mgmtIp ??= heard.mgmtIp;
+    same.sysName ??= heard.sysName;
+    // Both protocols describe the same device; some announce only part of their roles over LLDP.
+    const capabilities = LLDP_CAPABILITIES.filter((c) => same.capabilities?.includes(c) || heard.capabilities?.includes(c));
+    same.capabilities = capabilities.length ? capabilities : undefined;
+  }
+  for (const [k, v] of column(w.dot3Duplex ?? [], OID.dot3Duplex)) {
+    const iface = byIndex.get(Number(k));
+    const duplex = duplexOf(v);
+    if (iface && duplex) iface.duplex = duplex;
   }
 
   // PoE: ports delivering power, per-port watts when published, and the power budget.
@@ -414,6 +535,48 @@ export function parseGear(ip: string, w: GearWalks): GearDevice {
       iface.tagged = [...(iface.tagged ?? []), vlan].sort((a, b) => a - b);
     }
   }
+  // Cisco switches without 802.1Q tables: VLANs from VTP, trunks from the trunk port table (allowed
+  // VLANs that exist on the switch, which leaves out the unused rest of "allow all"), access ports
+  // from VLAN membership. The legacy VLANs 1002-1005 every Cisco switch lists are left out.
+  if (!vlanIds.size && w.ciscoVlanName?.length) {
+    for (const [k, v] of lastIndex(w.ciscoVlanName, OID.ciscoVlanName)) {
+      const id = Number(k);
+      if (id >= 1002 && id <= 1005) continue;
+      vlanIds.add(id);
+      vlanNames.set(k, v);
+    }
+    const trunking = column(w.ciscoTrunkStatus ?? [], OID.ciscoTrunkStatus);
+    const natives = column(w.ciscoTrunkNative ?? [], OID.ciscoTrunkNative);
+    const allowed = new Map<number, Set<number>>();
+    const bitmaps: [string, number][] = [
+      [OID.ciscoTrunkVlans1k, 0],
+      [OID.ciscoTrunkVlans2k, 1024],
+      [OID.ciscoTrunkVlans3k, 2048],
+      [OID.ciscoTrunkVlans4k, 3072],
+    ];
+    for (const vb of w.ciscoTrunkVlans ?? []) {
+      const [base, offset] = bitmaps.find(([b]) => suffix(vb.oid, b)) ?? [];
+      const ifIndex = base ? suffix(vb.oid, base)?.at(-1) : undefined;
+      if (ifIndex === undefined || offset === undefined || !Buffer.isBuffer(vb.value)) continue;
+      const set = allowed.get(ifIndex) ?? new Set<number>();
+      vb.value.forEach((byte, i) => {
+        for (let b = 0; b < 8; b++) if (byte & (0x80 >> b) && vlanIds.has(offset + i * 8 + b)) set.add(offset + i * 8 + b);
+      });
+      allowed.set(ifIndex, set);
+    }
+    for (const iface of interfaces) {
+      if (num(trunking.get(String(iface.ifIndex))) !== 1) continue;
+      const native = num(natives.get(String(iface.ifIndex)));
+      if (native) iface.pvid = native;
+      const tagged = [...(allowed.get(iface.ifIndex) ?? [])].filter((v) => v !== native).sort((a, b) => a - b);
+      if (tagged.length) iface.tagged = tagged;
+    }
+    for (const [k, v] of column(w.ciscoAccessVlan ?? [], OID.ciscoAccessVlan)) {
+      const iface = byIndex.get(Number(k));
+      const vlan = num(v);
+      if (iface && vlan && iface.pvid === undefined) iface.pvid = vlan;
+    }
+  }
   const vlans = [...vlanIds].sort((a, b) => a - b).map((id) => ({ id, name: text(vlanNames.get(String(id))) }));
 
   // Default route: the classic table answers by OID; the CIDR tables carry the next hop in the index.
@@ -488,44 +651,53 @@ export interface CounterReading {
   values: Map<number, { in: number; out: number }>;
 }
 
-/** Traffic state of one device: the reading rates are measured from, and the last rates per ifIndex. */
+/** Counters of one port and when they were read. */
+interface PortCounters {
+  at: number;
+  in: number;
+  out: number;
+}
+
+/** Traffic state of one device: per ifIndex, the counters rates are measured from and the last rates. */
 export interface DeviceTraffic {
-  base: CounterReading;
+  base: Map<number, PortCounters>;
   rates: Map<number, { inBps: number; outBps: number }>;
 }
 
 /**
  * Traffic state of a device that did not answer a sample: no rates until it answers again, and the
- * last reading stays the base, so the next answer is measured over the whole span.
+ * last readings stay the base, so the next answer is measured over the whole span.
  */
 export function missedTraffic(prev: DeviceTraffic | undefined): DeviceTraffic | undefined {
   return prev && { base: prev.base, rates: new Map() };
 }
 
-/** Longest a device may answer with identical counters before they are taken as no traffic. */
+/** Longest a port may answer with identical counters before they are taken as no traffic. */
 const COUNTER_HOLD_MS = 30_000;
 
 /**
- * Next traffic state after a new reading. Many switches refresh their counters every few seconds
- * and answer in between with the values they already gave: a reading where every counter is the
- * same as the base keeps the last rates and the base, so the next refresh is measured over the whole
- * span instead of showing a gap of zero traffic. Counters that stay the same for longer are idle.
+ * Next traffic state after a new reading. Many switches refresh each port's counters every few
+ * seconds, on its own schedule, and answer in between with the values they already gave: a port
+ * whose counters are the same as its base keeps its last rate and its base, so its next refresh is
+ * measured over the whole span instead of showing a gap of zero traffic. Counters that stay the
+ * same for longer are idle.
  */
 export function advanceTraffic(prev: DeviceTraffic | undefined, reading: CounterReading, holdMs = COUNTER_HOLD_MS): DeviceTraffic {
-  if (!prev) return { base: reading, rates: new Map() };
-  const { base } = prev;
-  const unchanged =
-    reading.values.size > 0 &&
-    [...reading.values].every(([i, v]) => {
-      const b = base.values.get(i);
-      return !!b && b.in === v.in && b.out === v.out;
-    });
-  if (unchanged && reading.at - base.at < holdMs) return prev;
-  const seconds = (reading.at - base.at) / 1000;
+  const base = new Map<number, PortCounters>();
   const rates = new Map<number, { inBps: number; outBps: number }>();
   for (const [i, v] of reading.values) {
-    const b = base.values.get(i);
-    if (b) rates.set(i, { inBps: rate(b.in, v.in, seconds), outBps: rate(b.out, v.out, seconds) });
+    const b = prev?.base.get(i);
+    const last = prev?.rates.get(i);
+    if (b && last && b.in === v.in && b.out === v.out && reading.at - b.at < holdMs) {
+      base.set(i, b);
+      rates.set(i, last);
+      continue;
+    }
+    base.set(i, { at: reading.at, ...v });
+    if (b) {
+      const seconds = (reading.at - b.at) / 1000;
+      rates.set(i, { inBps: rate(b.in, v.in, seconds), outBps: rate(b.out, v.out, seconds) });
+    }
   }
-  return { base: reading, rates };
+  return { base, rates };
 }

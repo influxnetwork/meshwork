@@ -4,6 +4,7 @@
  * remembered per network. Clicking a device opens its details.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type KeyboardEvent } from 'react';
+import { createPortal } from 'react-dom';
 import * as Dialog from '@radix-ui/react-dialog';
 import {
   BaseEdge,
@@ -29,13 +30,16 @@ import '@xyflow/react/dist/style.css';
 import { toPng, toSvg } from 'html-to-image';
 import {
   AlertTriangle,
+  ArrowUpFromLine,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Globe,
   ImageDown,
   FileSpreadsheet,
   FileText,
   LayoutGrid,
+  MapPin,
   Maximize,
   Network as NetworkIcon,
   PanelLeftClose,
@@ -50,6 +54,9 @@ import {
 } from 'lucide-react';
 import type { Asset, DeviceType, GearSnapshot, SnmpSettings } from '@shared/types';
 import { describeLoop, findLoops } from '@shared/loops';
+import { inCidr } from '@shared/report';
+import { unscannedNetworks } from '@shared/unscanned';
+import { describeMismatch, findLinkMismatches, mismatchAdvice } from '@shared/link-mismatch';
 import { cleanError } from './store';
 import { useStore } from './store';
 import { DeviceTile, EmptyState, displayName, relativeTime } from './ui';
@@ -67,6 +74,7 @@ import {
   layoutTree,
   placeCableLabels,
   searchMap,
+  vlanLabel,
   type Attachment,
   type Box,
   type CableLabels,
@@ -136,8 +144,12 @@ interface DeviceData extends Record<string, unknown> {
   detail?: string;
   deviceType?: DeviceType;
   managed?: boolean;
-  /** True when `label` is the device's own LLDP name. */
+  /** True when `label` is the device's own LLDP or CDP name. */
   announced?: boolean;
+  /** True when `deviceType` comes from the device's own reading. */
+  typeRead?: boolean;
+  /** True for the computer the map is drawn from. */
+  self?: boolean;
   /** Address range of a separate network behind the gateway. */
   network?: string;
   /** Traffic on a contained device's switch port, in bits per second. */
@@ -151,9 +163,23 @@ interface DeviceData extends Record<string, unknown> {
   vlanColor?: string;
   /** Behind an access point, usually over Wi-Fi. */
   wireless?: boolean;
+  /** VLANs this router routes, with their colours; picking one shows that VLAN on the map. */
+  routes?: { vlan: number; network: string; port: string; color: string }[];
+  shownVlan?: number;
+  onVlan?: (vlan: number) => void;
   showIp: boolean;
   showVendor: boolean;
   gateway: boolean;
+}
+
+interface ExitData extends Record<string, unknown> {
+  /** Set when the way out is not the internet itself. */
+  label?: string;
+  detail?: string;
+  /** Next hop of the default route that leads out. */
+  via?: string;
+  /** Set when the next hop's network was not scanned: the range to scan to identify it. */
+  scan?: { cidr: string; busy: boolean; run: () => void };
 }
 
 interface LinkData extends Record<string, unknown> {
@@ -168,6 +194,14 @@ interface LinkData extends Record<string, unknown> {
   rate?: number;
   /** Where the link meets each node, on the sides that face each other. */
   at?: Attachment;
+  /** A link between two routers that each head their own tree: both ends are drawn as plain ports. */
+  peer?: boolean;
+  /** The link runs over a tunnel. */
+  tunnel?: boolean;
+  /** True when the router that routes `routes` is at the target end of the link. */
+  routesAtTarget?: boolean;
+  /** Networks a router routes on this link, on its own interface and on VLAN subinterfaces. */
+  routes?: { vlan?: number; network: string; ip: string; port: string }[];
   /** VLANs on the switch port: "V69" for an access port, "1, 69" for a trunk. */
   vlanText?: string;
   /** Outside the VLAN being shown. */
@@ -195,6 +229,15 @@ interface GroupData extends Record<string, unknown> {
 
 const hidden = { opacity: 0 };
 
+/** Marks the computer the map is drawn from. */
+function YouBadge() {
+  return (
+    <span className="map-you" title="You are here: this is the computer running Meshwork. The map is drawn from what it can reach.">
+      <MapPin className="icon" aria-hidden /> You are here
+    </span>
+  );
+}
+
 function DeviceNode({ data, selected }: NodeProps<Node<DeviceData>>) {
   const a = data.asset;
   const sub = [data.showIp ? (a?.ip ?? data.ip) : undefined, data.showVendor && a?.vendor && a.vendor !== 'Private address' ? a.vendor : undefined]
@@ -207,11 +250,12 @@ function DeviceNode({ data, selected }: NodeProps<Node<DeviceData>>) {
     a?.hostname ||
     (known && known !== a?.ip ? known : (data.label ?? known ?? (data.gateway ? 'Gateway' : 'Unknown device')));
   // A type the device announced over LLDP beats the scan's guess.
-  const type = data.announced && data.deviceType && data.deviceType !== 'unknown' ? data.deviceType : a?.type && a.type !== 'unknown' ? a.type : data.deviceType;
+  const type = (data.announced || data.typeRead) && data.deviceType && data.deviceType !== 'unknown' ? data.deviceType : a?.type && a.type !== 'unknown' ? a.type : data.deviceType;
   return (
-    <div className={`map-node device${data.gateway ? ' gateway' : ''}${selected ? ' selected' : ''}`} title={data.detail}>
+    <div className={`map-node device${data.gateway ? ' gateway' : ''}${data.routes?.length ? ' routes' : ''}${data.self ? ' self' : ''}${selected ? ' selected' : ''}`} title={data.detail}>
       <Handle type="target" position={Position.Top} style={hidden} isConnectable={false} />
       {data.managed && <span className="map-managed">SNMP</span>}
+      {data.self && <YouBadge />}
       {data.network ? (
         <div className="map-glyph net">
           <NetworkIcon className="icon" />
@@ -226,6 +270,26 @@ function DeviceNode({ data, selected }: NodeProps<Node<DeviceData>>) {
       <div className="map-text">
         <b title={name}>{name}</b>
         {sub && sub !== name && <span title={sub}>{sub}</span>}
+        {data.routes?.length ? (
+          <div className="map-routes" aria-label="VLANs this router routes">
+            <span>VLAN</span>
+            {data.routes.map((r) => (
+              <button
+                key={r.vlan}
+                className={`map-route nodrag${data.shownVlan === r.vlan ? ' on' : ''}`}
+                style={{ '--vlan': r.color } as React.CSSProperties}
+                title={`VLAN ${r.vlan} · ${r.network} on ${r.port}. Show this VLAN on the map.`}
+                aria-pressed={data.shownVlan === r.vlan}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  data.onVlan?.(r.vlan);
+                }}
+              >
+                {r.vlan}
+              </button>
+            ))}
+          </div>
+        ) : null}
       </div>
       {a?.risks.length ? <span className="map-risk" title={`${a.risks.length} ${a.risks.length === 1 ? 'risk' : 'risks'}`} /> : null}
       <Handle type="source" position={Position.Bottom} style={hidden} isConnectable={false} />
@@ -248,7 +312,8 @@ function MemberNode({ data, selected }: NodeProps<Node<DeviceData>>) {
   const firm = (data.announced || data.deviceType === 'vm') && data.deviceType && data.deviceType !== 'unknown';
   const type = firm ? (data.deviceType as DeviceType) : a?.type && a.type !== 'unknown' ? a.type : (data.deviceType ?? 'unknown');
   return (
-    <div className={`map-member${selected ? ' selected' : ''}${a ? '' : ' learned'}`} title={a ? undefined : 'Seen by a switch; not in the inventory yet'}>
+    <div className={`map-member${selected ? ' selected' : ''}${a ? '' : ' learned'}${data.self ? ' self' : ''}`} title={a ? undefined : 'Seen by a switch; not in the inventory yet'}>
+      {data.self && <YouBadge />}
       <DeviceTile type={type} size="sm" />
       <div className="map-text">
         <b title={name}>{name}</b>
@@ -275,15 +340,30 @@ function MemberNode({ data, selected }: NodeProps<Node<DeviceData>>) {
   );
 }
 
-function InternetNode() {
+/** A way out of the network: the internet, or the next hop that was not read ("Upstream"). */
+function InternetNode({ data }: NodeProps<Node<ExitData>>) {
+  const upstream = !!data.label;
   return (
-    <div className="map-node internet">
-      <div className="map-glyph">
-        <Globe className="icon" />
-      </div>
+    <div className={`map-node internet${upstream ? ' upstream' : ''}`} title={data.detail}>
+      <div className="map-glyph">{upstream ? <ArrowUpFromLine className="icon" /> : <Globe className="icon" />}</div>
       <div className="map-text">
-        <b>Internet</b>
+        <b>{data.label ?? 'Internet'}</b>
+        {data.via && <span title={`Next hop of the default route: ${data.via}`}>via {data.via}</span>}
       </div>
+      {data.scan && (
+        <button
+          className="map-exit-scan nodrag"
+          disabled={data.scan.busy}
+          title={`${data.via} was not scanned. Scan ${data.scan.cidr} to find out what it is.`}
+          aria-label={`Scan ${data.scan.cidr}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            data.scan?.run();
+          }}
+        >
+          <Search className="icon" aria-hidden />
+        </button>
+      )}
       <Handle type="source" position={Position.Bottom} style={hidden} isConnectable={false} />
     </div>
   );
@@ -384,7 +464,36 @@ const cableLabelBoxes = (() => {
 function middleLabel(data?: LinkData): string[] {
   if (data?.redundant) return [data.redundant.blocked ? 'Blocked by spanning tree' : 'Redundant link'];
   const rate = data?.rate ?? 0;
-  return [data?.poe ? (data.poeWatts ? `${data.poeWatts} W` : 'PoE') : '', rate >= FLOW_MIN_BPS ? formatRate(rate) : ''].filter(Boolean);
+  return [data?.tunnel ? 'Tunnel' : '', data?.poe ? (data.poeWatts ? `${data.poeWatts} W` : 'PoE') : '', rate >= FLOW_MIN_BPS ? formatRate(rate) : ''].filter(Boolean);
+}
+
+/**
+ * The networks a router port carries, shown at once beside the port while the pointer is on it.
+ * It is drawn over the whole window so device cards never cover it, and kept inside the window.
+ */
+function RoutesTip({ at, port, routes }: { at: DOMRect; port?: string; routes: { vlan?: number; network: string; ip: string; port: string }[] }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ left: at.right + 8, top: at.top });
+  useLayoutEffect(() => {
+    const box = ref.current?.getBoundingClientRect();
+    if (!box) return;
+    const fitsRight = at.right + 8 + box.width <= window.innerWidth - 8;
+    const left = fitsRight ? at.right + 8 : Math.max(8, at.left - 8 - box.width);
+    const top = Math.min(Math.max(8, at.top + at.height / 2 - box.height / 2), window.innerHeight - box.height - 8);
+    setPos({ left, top });
+  }, [at]);
+  return (
+    <div ref={ref} className="map-port-tip" role="tooltip" style={pos}>
+      <b>Networks routed on {port}</b>
+      {routes.map((r) => (
+        <span key={`${r.port}|${r.ip}`} className="map-port-tip-row">
+          <span>{r.port}</span>
+          <span>{`${r.ip}/${r.network.split('/')[1]}`}</span>
+          <span>{r.vlan !== undefined ? `VLAN ${r.vlan}` : ''}</span>
+        </span>
+      ))}
+    </div>
+  );
 }
 
 /** A link with port names at both ends, PoE colour and, while traffic flows, a moving dash. */
@@ -473,6 +582,28 @@ function LinkEdge(props: EdgeProps<Edge<LinkData>>) {
   const level = Math.min(1, Math.log10(1 + rate) / 9);
   const redundant = data?.redundant;
   const middle = middleLabel(data);
+  const subinterfaces = data?.routes?.filter((r) => r.vlan !== undefined).length ?? 0;
+  const [tipAt, setTipAt] = useState<DOMRect>();
+  // The port that carries the routed networks shows them while the pointer or the keyboard is on it.
+  const routedAt = data?.routes?.length ? (data.routesAtTarget ? 'target' : 'source') : undefined;
+  const tipProps = {
+    tabIndex: 0,
+    onMouseEnter: (e: React.MouseEvent<HTMLDivElement>) => setTipAt(e.currentTarget.getBoundingClientRect()),
+    onMouseLeave: () => setTipAt(undefined),
+    onFocus: (e: React.FocusEvent<HTMLDivElement>) => setTipAt(e.currentTarget.getBoundingClientRect()),
+    onBlur: () => setTipAt(undefined),
+  };
+  // The map moving under the pointer leaves the box in the wrong place: it closes.
+  useEffect(() => {
+    if (!tipAt) return;
+    const close = () => setTipAt(undefined);
+    window.addEventListener('wheel', close, { passive: true });
+    window.addEventListener('pointerdown', close);
+    return () => {
+      window.removeEventListener('wheel', close);
+      window.removeEventListener('pointerdown', close);
+    };
+  }, [tipAt]);
   return (
     <>
       <path ref={measure} d={path} fill="none" stroke="none" aria-hidden />
@@ -500,32 +631,40 @@ function LinkEdge(props: EdgeProps<Edge<LinkData>>) {
         {data?.sourcePort && (
           <div
             ref={srcRef}
-            className={`map-port src${redundant?.blockedEnd === 'source' ? ' blocked' : ''}`}
-            title={redundant?.blockedEnd === 'source' ? 'Spanning tree blocks this port' : data.sourcePortsAll}
+            className={`map-port src${redundant?.blockedEnd === 'source' ? ' blocked' : ''}${routedAt === 'source' ? ' has-tip' : ''}`}
+            title={redundant?.blockedEnd === 'source' ? 'Spanning tree blocks this port' : routedAt === 'source' ? undefined : data.sourcePortsAll}
             style={{ transform: onLine(srcAt, sx, sy) }}
+            {...(routedAt === 'source' ? tipProps : {})}
           >
             {data.sourcePort}
-            {data.vlanText ? <span className="map-vlan-tag"> · {data.vlanText}</span> : null}
+            {routedAt === 'source' && subinterfaces ? <span className="map-sub-count"> ({subinterfaces})</span> : null}
           </div>
         )}
-        {data?.targetPort && redundant && (
+        {tipAt && data?.routes?.length
+          ? createPortal(<RoutesTip at={tipAt} port={routedAt === 'target' ? data.targetPort : data.sourcePort} routes={data.routes} />, document.body)
+          : null}
+        {data?.targetPort && (redundant || data.peer) && (
           <div
             ref={dstRef}
-            className={`map-port dst${redundant.blockedEnd === 'target' ? ' blocked' : ''}`}
-            title={redundant.blockedEnd === 'target' ? 'Spanning tree blocks this port' : undefined}
+            className={`map-port dst${redundant?.blockedEnd === 'target' ? ' blocked' : ''}${routedAt === 'target' ? ' has-tip' : ''}`}
+            title={redundant?.blockedEnd === 'target' ? 'Spanning tree blocks this port' : undefined}
             style={{ transform: onLine(dstAt, tx, ty) }}
+            {...(routedAt === 'target' ? tipProps : {})}
           >
             {data.targetPort}
+            {routedAt === 'target' && subinterfaces ? <span className="map-sub-count"> ({subinterfaces})</span> : null}
           </div>
         )}
-        {data?.targetPort && !redundant && (
+        {data?.targetPort && !redundant && !data.peer && (
           <div
             ref={dstRef}
-            className="map-port dst uplink"
-            title={`Uplink: the port this device uses to reach the network above it`}
+            className={`map-port dst uplink${routedAt === 'target' ? ' has-tip' : ''}`}
+            title={routedAt === 'target' ? undefined : `Uplink: the port this device uses to reach the network above it`}
             style={{ transform: onLine(dstAt, tx, ty) }}
+            {...(routedAt === 'target' ? tipProps : {})}
           >
             <span aria-hidden>↑</span> {data.targetPort}
+            {routedAt === 'target' && subinterfaces ? <span className="map-sub-count"> ({subinterfaces})</span> : null}
           </div>
         )}
         {middle.length > 0 && (
@@ -875,6 +1014,8 @@ function MapCanvas() {
     });
   const [focused, setFocused] = useState<string>();
   const [vlanFilter, setVlanFilter] = useState<number>();
+  /** Shows one VLAN on the map, or every VLAN again when it is already shown. */
+  const showVlan = useCallback((vlan: number) => setVlanFilter((v) => (v === vlan ? undefined : vlan)), []);
   const [snmp, setSnmp] = useState<SnmpSettings>({ configured: false });
   const [gear, setGear] = useState<GearSnapshot | null>(null);
   const [reading, setReading] = useState(false);
@@ -965,15 +1106,40 @@ function MapCanvas() {
     };
   }, [liveOn, currentId, gear]);
 
+  // This computer's addresses, to mark where the map is drawn from.
+  const [selfIps, setSelfIps] = useState<string[]>([]);
+  useEffect(() => {
+    let alive = true;
+    void window.api.scan
+      .localTargets()
+      .then((list) => {
+        const next = list.map((t) => t.address);
+        // The same addresses keep the same list, so the map is not rebuilt for nothing.
+        if (alive) setSelfIps((prev) => (prev.length === next.length && prev.every((ip, i) => ip === next[i]) ? prev : next));
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [currentId]);
   const members = useMemo(() => (network ? Object.values(assets).filter((a) => a.networkId === network.id) : []), [assets, network]);
   const topo = useMemo(
     () =>
       network
-        ? buildTopology(network, members, { clients: prefs.clients, collapsed: new Set(prefs.collapsed) }, gear)
+        ? buildTopology(network, members, { clients: prefs.clients, collapsed: new Set(prefs.collapsed), self: selfIps }, gear)
         : { nodes: [], edges: [], confirmed: false },
-    [network, members, prefs.clients, prefs.collapsed, gear],
+    [network, members, prefs.clients, prefs.collapsed, gear, selfIps],
   );
   const layout = useMemo(() => layoutTree(topo), [topo]);
+
+  // Networks the managed routers hold that were not scanned, offered to be scanned into this network.
+  const scanInto = useStore((s) => s.scanInto);
+  const scanning = useStore((s) => s.scan.running);
+  const unscanned = useMemo(
+    () => (network && gear?.devices.length ? unscannedNetworks(gear.devices, network.cidr, members.map((a) => a.ip)) : []),
+    [network, gear, members],
+  );
+  const scanNetwork = useCallback((cidr: string) => (currentId ? void scanInto(currentId, cidr) : undefined), [currentId, scanInto]);
 
   /**
    * Every device that can be drawn for this network, whatever the view and folded groups, so the
@@ -1042,17 +1208,28 @@ function MapCanvas() {
   /** Nodes and links that belong to the VLAN being shown; everything else is dimmed. */
   const inVlan = useMemo(() => {
     if (vlanFilter === undefined) return undefined;
-    const carries = (e: (typeof topo.edges)[number]) => e.vlan?.pvid === vlanFilter || !!e.vlan?.tagged?.includes(vlanFilter);
-    const edges = new Set([...topo.edges, ...(topo.redundant ?? [])].filter(carries).map((e) => e.id));
+    // A cable carries the VLAN when its switch port does, or when the router at its top end routes it there.
+    const carries = (e: (typeof topo.edges)[number]) =>
+      e.vlan?.pvid === vlanFilter || !!e.vlan?.tagged?.includes(vlanFilter) || !!e.routes?.some((r) => r.vlan === vlanFilter);
+    const edges = new Set([...topo.edges, ...(topo.redundant ?? []), ...(topo.peers ?? [])].filter(carries).map((e) => e.id));
     const nodes = new Set<string>();
     for (const e of topo.edges) if (edges.has(e.id)) nodes.add(e.source).add(e.target);
-    for (const e of topo.redundant ?? []) if (edges.has(e.id)) nodes.add(e.source).add(e.target);
+    for (const e of [...(topo.redundant ?? []), ...(topo.peers ?? [])]) if (edges.has(e.id)) nodes.add(e.source).add(e.target);
+    // The networks routers serve on this VLAN: a device with an address in one belongs to it.
+    const served = topo.nodes.flatMap((n) => (n.routes ?? []).filter((r) => r.vlan === vlanFilter).map((r) => r.network));
     for (const n of topo.nodes) {
-      if (n.kind === 'internet' || n.kind === 'gateway') nodes.add(n.id);
-      if (n.parent && (n.vlan === vlanFilter || n.tagged?.includes(vlanFilter))) nodes.add(n.id).add(n.parent);
+      // The router that routes the VLAN is part of it.
+      if (n.routes?.some((r) => r.vlan === vlanFilter)) nodes.add(n.id);
+      const ip = (n.assetId ? assets[n.assetId]?.ip : undefined) ?? n.ip;
+      const inServed = n.kind === 'device' && !n.managed && !!ip && served.some((net) => inCidr(ip, net));
+      if (inServed) nodes.add(n.id);
+      if (n.parent && (inServed || n.vlan === vlanFilter || n.tagged?.includes(vlanFilter))) nodes.add(n.id).add(n.parent);
     }
+    // The cable to a group of devices in the VLAN is lit with it.
+    const groups = new Set(topo.nodes.filter((n) => n.kind === 'group').map((n) => n.id));
+    for (const e of topo.edges) if (groups.has(e.target) && nodes.has(e.source) && nodes.has(e.target)) edges.add(e.id);
     return { nodes, edges };
-  }, [vlanFilter, topo]);
+  }, [vlanFilter, topo, assets]);
 
   /** Node boxes on the canvas, following drags, for attaching links to the facing sides. */
   // Redundant cables are cabling between network gear: drawn in the infrastructure view only.
@@ -1070,8 +1247,8 @@ function MapCanvas() {
       const h = n.measured?.height ?? size?.h;
       if (w && h) boxes.set(n.id, { x: n.position.x, y: n.position.y, w, h });
     }
-    return attachLinks(boxes, [...topo.edges, ...redundantShown]);
-  }, [nodes, layout, topo.edges, redundantShown]);
+    return attachLinks(boxes, [...topo.edges, ...redundantShown, ...(topo.peers ?? [])]);
+  }, [nodes, layout, topo.edges, topo.peers, redundantShown]);
 
   useEffect(() => {
     const label = (n: MapNode) => n.title ?? CATEGORIES.find((c) => c.id === n.category)?.label ?? 'Devices';
@@ -1082,7 +1259,11 @@ function MapCanvas() {
         const size = layout.sizes[n.id];
         // Showing one VLAN dims everything outside it.
         const className = inVlan && !inVlan.nodes.has(n.id) ? 'dim' : undefined;
-        if (n.kind === 'internet') return { id: n.id, type: 'internet', position, data: {}, selectable: false, className };
+        if (n.kind === 'internet') {
+          const offer = n.label ? unscanned.find((u) => u.nextHop === n.ip) : undefined;
+          const scan = offer ? { cidr: offer.cidr, busy: scanning, run: () => scanNetwork(offer.cidr) } : undefined;
+          return { id: n.id, type: 'internet', position, data: { label: n.label, detail: n.detail, via: n.ip, scan } satisfies ExitData, selectable: false, className };
+        }
         if (n.kind === 'group') {
           const data: GroupData = { label: label(n), count: n.count ?? 0, collapsed: !!n.collapsed, onToggle: () => toggleGroup(n.id) };
           return { id: n.id, type: 'cluster', position, selectable: false, data, className, style: { width: size?.w, height: size?.h } };
@@ -1095,6 +1276,8 @@ function MapCanvas() {
           deviceType: n.deviceType,
           managed: n.managed,
           announced: n.announced,
+          typeRead: n.typeRead,
+          self: n.self,
           network: n.network,
           port: n.port,
           poe: n.poe,
@@ -1103,6 +1286,9 @@ function MapCanvas() {
           vlanColor: n.vlan && n.vlan !== 1 ? vlanColor(n.vlan) : undefined,
           rate: n.traffic && liveOn ? traffic.get(`${n.traffic.ip}|${n.traffic.ifIndex}`) : undefined,
           wireless: n.wireless,
+          routes: n.routes?.flatMap((r) => (r.vlan !== undefined ? [{ vlan: r.vlan, network: r.network, port: r.port, color: vlanColor(r.vlan) }] : [])),
+          shownVlan: vlanFilter,
+          onVlan: showVlan,
           showIp: prefs.ip,
           showVendor: prefs.vendor,
           gateway: n.kind === 'gateway',
@@ -1111,7 +1297,7 @@ function MapCanvas() {
         return { id: n.id, type: 'device', position, data, className };
       }),
     );
-  }, [topo, layout, saved, assets, prefs.ip, prefs.vendor, toggleGroup, inVlan, vlanColor, traffic, liveOn]);
+  }, [topo, layout, saved, assets, prefs.ip, prefs.vendor, toggleGroup, inVlan, vlanColor, traffic, liveOn, vlanFilter, showVlan, unscanned, scanning, scanNetwork]);
 
   /**
    * Traffic on a cable to a group: the total of its devices, shown only while at least one of them is
@@ -1134,12 +1320,15 @@ function MapCanvas() {
           source: e.source,
           target: e.target,
           type: 'link',
-          className: `map-edge${e.inferred ? ' inferred' : ''}${e.poe ? ' poe' : ''}${inVlan && !inVlan.edges.has(e.id) ? ' dim' : ''}`,
+          className: `map-edge${e.inferred ? ' inferred' : ''}${e.tunnel ? ' tunnel' : ''}${e.poe ? ' poe' : ''}${inVlan && !inVlan.edges.has(e.id) ? ' dim' : ''}`,
           selectable: false,
           data: {
             order,
             sourcePort: e.sourcePort,
             sourcePortsAll: e.sourcePortsAll,
+            routes: e.routes,
+            routesAtTarget: e.routesAtTarget,
+            tunnel: e.tunnel,
             targetPort: e.targetPort,
             poe: e.poe,
             poeWatts: e.poeWatts,
@@ -1154,11 +1343,7 @@ function MapCanvas() {
               : e.vlan?.pvid && e.vlan.pvid !== 1
                 ? [vlanColor(e.vlan.pvid)]
                 : undefined,
-            vlanText: e.vlan?.tagged?.length
-              ? [e.vlan.pvid, ...e.vlan.tagged].filter((v) => v !== undefined).join(', ')
-              : e.vlan?.pvid && e.vlan.pvid !== 1
-                ? `V${e.vlan.pvid}`
-                : undefined,
+            vlanText: vlanLabel(e.vlan),
           },
         }),
       ),
@@ -1184,8 +1369,33 @@ function MapCanvas() {
           },
         }),
       ),
+      // Links between routers that each have their own way out: drawn side to side, in every view.
+      ...(topo.peers ?? []).map(
+        (e, i): Edge<LinkData> => ({
+          id: e.id,
+          source: e.source,
+          target: e.target,
+          type: 'link',
+          className: `map-edge peer${e.tunnel ? ' tunnel' : ''}${inVlan && !inVlan.edges.has(e.id) ? ' dim' : ''}`,
+          selectable: false,
+          data: {
+            order: topo.edges.length + redundantShown.length + i,
+            sourcePort: e.sourcePort,
+            targetPort: e.targetPort,
+            speedMbps: e.speedMbps,
+            routes: e.routes,
+            routesAtTarget: e.routesAtTarget,
+            rate: liveOn && e.traffic ? traffic.get(`${e.traffic.ip}|${e.traffic.ifIndex}`) : undefined,
+            at: attachments.get(e.id),
+            dim: !!inVlan && !inVlan.edges.has(e.id),
+            peer: true,
+            tunnel: e.tunnel,
+            vlanText: vlanLabel(e.vlan),
+          },
+        }),
+      ),
     ],
-    [topo.edges, redundantShown, traffic, liveOn, attachments, inVlan, groupRate],
+    [topo.edges, topo.peers, redundantShown, traffic, liveOn, attachments, inVlan, groupRate],
   );
 
   // Fits the drawing whenever another network or view is shown.
@@ -1419,10 +1629,11 @@ function MapCanvas() {
   const openedNode = openId ? fullIndex.byAsset.get(openId) : undefined;
   const openedGear =
     openedNode && (openedNode.managed || openedNode.announced)
-      ? { name: openedNode.label, description: openedNode.detail, type: openedNode.deviceType, source: openedNode.managed ? ('snmp' as const) : ('lldp' as const) }
+      ? { name: openedNode.label, description: openedNode.detail, type: openedNode.deviceType, source: gearSource(openedNode) }
       : undefined;
   const risky = members.filter((a) => a.risks.length).length;
   const loops = findLoops(gear?.devices ?? []);
+  const mismatches = findLinkMismatches(gear?.devices ?? []);
 
   return (
     <div className={`map-page${sideHidden ? ' side-hidden' : ''}`}>
@@ -1479,6 +1690,50 @@ function MapCanvas() {
               </div>
             );
           })}
+
+          {mismatches.map((m) => {
+            const nodeId = m.local.ip ? gearNodeId(m.local.ip) : undefined;
+            return (
+              <div key={`${m.kind}|${m.local.ip}|${m.local.port}`} className="map-loop" role="alert">
+                <p>
+                  <AlertTriangle className="icon" aria-hidden /> <b>{m.kind === 'nativeVlan' ? 'Native VLAN mismatch' : 'Duplex mismatch'}:</b> {describeMismatch(m)}.
+                </p>
+                <p className="muted">{mismatchAdvice(m.kind)}</p>
+                {nodeId && (
+                  <button className="btn sm" onClick={() => focusNode(nodeId)}>
+                    Show on the map
+                  </button>
+                )}
+              </div>
+            );
+          })}
+
+          {unscanned.length > 0 && (
+            <div className="map-unscanned">
+              <p>
+                <Search className="icon" aria-hidden /> <b>{unscanned.length === 1 ? 'A network was not scanned' : `${unscanned.length} networks were not scanned`}.</b> The devices read over SNMP are on{' '}
+                {unscanned.length === 1 ? 'it' : 'them'}; scanning adds what is there to this map.
+              </p>
+              <ul>
+                {unscanned.slice(0, 6).map((u) => (
+                  <li key={u.cidr}>
+                    <span>
+                      <b>{u.cidr}</b>
+                      <small>
+                        {u.device}
+                        {u.port ? ` ${u.port}` : ''}
+                        {u.nextHop ? ` · way out via ${u.nextHop}` : ''}
+                      </small>
+                    </span>
+                    <button className="btn sm" disabled={scanning} onClick={() => scanNetwork(u.cidr)}>
+                      Scan
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {scanning && <p className="muted">Scanning…</p>}
+            </div>
+          )}
 
           <MapSection
             id="snmp"
@@ -1659,39 +1914,6 @@ function MapCanvas() {
             </div>
           </MapSection>
 
-          <MapSection id="legend" title="Legend" open={sections} onToggle={toggleSection}>
-            <div className="map-legend">
-              <div>
-                <i className="line" /> Seen by a switch
-              </div>
-              <div>
-                <i className="line poe" /> Powered over Ethernet
-              </div>
-              {topo.vlans?.some((v) => v.id !== 1) && (
-                <>
-                  <div>
-                    <i className="line vlan" style={{ borderTopColor: vlanColor(topo.vlans.find((v) => v.id !== 1)?.id ?? 1) }} /> Port in a VLAN (its colour)
-                  </div>
-                  <div>
-                    <i className="line trunk" /> Trunk: several VLANs
-                  </div>
-                </>
-              )}
-              <div>
-                <i className="line inferred" /> Assumed link
-              </div>
-              {redundantShown.length ? (
-                <div>
-                  <i className="line redundant" /> Redundant link: it closes a ring
-                </div>
-              ) : null}
-              <p className="muted">
-                {topo.confirmed
-                  ? 'Devices sit on the switch port where their address was learned. Devices no switch has seen stay with the gateway.'
-                  : 'Links are drawn from what each device is. Read the network devices over SNMP to draw the real cabling and ports.'}
-              </p>
-            </div>
-          </MapSection>
         </aside>
       )}
 
@@ -1702,6 +1924,58 @@ function MapCanvas() {
           </button>
         )}
         <MapSearch entries={searchIndex.entries} shifted={sideHidden} onPick={goToDevice} />
+        <div className={`map-legend-float${sections.legend ? ' open' : ''}`}>
+          <button
+            className="map-legend-h"
+            aria-expanded={!!sections.legend}
+            aria-controls="map-legend-body"
+            onClick={() => toggleSection('legend')}
+            title={
+              topo.confirmed
+                ? 'Devices sit on the switch port where their address was learned. Devices no switch has seen stay with the gateway.'
+                : 'Links are drawn from what each device is. Read the network devices over SNMP to draw the real cabling and ports.'
+            }
+          >
+            {sections.legend ? <ChevronLeft className="icon" /> : <ChevronRight className="icon" />}
+            <span>Legend</span>
+          </button>
+          {sections.legend && (
+            <div className="map-legend" id="map-legend-body">
+              <span title="A cable a switch reported">
+                <i className="line" /> Switch link
+              </span>
+              <span title="Powered over Ethernet">
+                <i className="line poe" /> PoE
+              </span>
+              {topo.vlans?.some((v) => v.id !== 1) && (
+                <>
+                  <span title="A port in one VLAN, drawn in that VLAN's colour">
+                    <i className="line vlan" style={{ borderTopColor: vlanColor(topo.vlans.find((v) => v.id !== 1)?.id ?? 1) }} /> VLAN
+                  </span>
+                  <span title="A port carrying several VLANs">
+                    <i className="line trunk" /> Trunk
+                  </span>
+                  <span title="Untagged (U) and tagged (T) VLANs on the port">
+                    <code className="map-legend-tag">U1 T10</code> Untagged / tagged
+                  </span>
+                </>
+              )}
+              <span title="A link drawn from what each device is, not reported by a switch">
+                <i className="line inferred" /> Assumed
+              </span>
+              {[...topo.edges, ...(topo.peers ?? [])].some((e) => e.tunnel) ? (
+                <span title="A link that runs over a tunnel between two routers">
+                  <i className="line tunnel" /> Tunnel
+                </span>
+              ) : null}
+              {redundantShown.length ? (
+                <span title="A link that closes a ring">
+                  <i className="line redundant" /> Redundant
+                </span>
+              ) : null}
+            </div>
+          )}
+        </div>
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -1748,9 +2022,9 @@ function MapCanvas() {
             facts={facts(otherNode)}
             gear={
               otherNode.managed || otherNode.announced
-                ? { name: otherNode.label, description: otherNode.detail, type: otherNode.deviceType, source: otherNode.managed ? 'snmp' : 'lldp' }
+                ? { name: otherNode.label, description: otherNode.detail, type: otherNode.deviceType, source: gearSource(otherNode) }
                 : otherNode.deviceType && otherNode.deviceType !== 'unknown'
-                  ? { type: otherNode.deviceType, source: 'lldp' }
+                  ? { type: otherNode.deviceType, source: gearSource(otherNode) }
                   : undefined
             }
             connection={connections.find((r) => r.id === otherNode.id) ?? segmentConnection(otherNode)}
@@ -1786,12 +2060,17 @@ function MapCanvas() {
   );
 }
 
+/** Where the facts about a map device came from: SNMP for managed gear, else the protocol it announced itself over. */
+function gearSource(n: MapNode): 'snmp' | 'lldp' | 'cdp' {
+  return n.managed ? 'snmp' : n.announcedVia === 'CDP' ? 'cdp' : 'lldp';
+}
+
 /** Where Meshwork learned about a device that is not in the inventory. */
 function nodeNote(n: MapNode): string {
   if (n.kind === 'gateway') return "The network's gateway, taken from this computer's settings or the switches. Scan this network in Discover to add it to the inventory.";
   if (n.id.startsWith('segment:')) return 'Several devices were learned on one switch port with no managed device behind it: an unmanaged switch, a hub or an access point that does not answer SNMP.';
   if (n.managed) return 'Read over SNMP. Scan this network in Discover to add it to the inventory.';
-  if (n.id.startsWith('lldp:')) return 'It announced itself to a switch over LLDP but did not answer the scan. Scan this network in Discover to add it to the inventory.';
+  if (n.id.startsWith('lldp:')) return `It announced itself to a switch over ${n.announcedVia ?? 'LLDP'} but did not answer the scan. Scan this network in Discover to add it to the inventory.`;
   if (n.id.startsWith('mac:')) return 'A switch learned its MAC address on this port, but it did not answer the scan: it may be off, asleep, firewalled or on another subnet.';
   return 'Drawn from what the switches report. Scan this network in Discover to add it to the inventory.';
 }
@@ -1849,7 +2128,7 @@ function SnmpDialog({
           <Dialog.Description asChild>
             <p>
               Enter the read-only SNMP v2c community of this network's devices: routers, switches, access points or anything else that
-              offers SNMP. Meshwork only reads: interfaces, neighbours (LLDP), routes, the addresses learned on each port and PoE. {protectionNote(platform)}
+              offers SNMP. Meshwork only reads: interfaces, neighbours (LLDP and CDP), routes, the addresses learned on each port and PoE. {protectionNote(platform)}
             </p>
           </Dialog.Description>
           <form

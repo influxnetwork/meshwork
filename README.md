@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.5.20-6366f1">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.5.21-6366f1">
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-334155">
   <img alt="Licence" src="https://img.shields.io/badge/licence-GPL--3.0-16a34a">
   <img alt="Status" src="https://img.shields.io/badge/status-pre--1.0-f59e0b">
@@ -35,10 +35,10 @@ results are never uploaded.
 Meshwork does **not** try to be a monitoring system or an enterprise network management
 platform. It does not collect NetFlow, keep uptime history, send alerts, or change device
 configuration. Everything it reads from switches and routers is **read-only** (SNMP v2c `get`
-and `walk` only). Its map shows the physical and layer 2 picture (switch ports, LLDP, VLANs,
+and `walk` only). Its map shows the physical and layer 2 picture (switch ports, LLDP, CDP, VLANs,
 spanning tree) plus the routing facts needed to place networks behind a gateway. It does not
-model VRFs, MPLS, overlays or tunnels yet, and it does not read CDP. What is planned, and what
-is deliberately out of scope, is in [ROADMAP.md](ROADMAP.md).
+model VRFs, MPLS, overlays or tunnels yet. What is planned, and what is deliberately out of
+scope, is in [ROADMAP.md](ROADMAP.md).
 
 ## Why it is open source
 
@@ -53,7 +53,7 @@ If it is useful to you, take it. If it gets something wrong on your equipment, a
 evidence (see *Contributing*) is the best way to make it better. It will keep improving one
 release at a time.
 
-## What it does today (0.5.20)
+## What it does today (0.5.21)
 
 ### Discover
 
@@ -101,15 +101,20 @@ release at a time.
 The map is drawn automatically from scans and from switches and routers read over **SNMP v2c
 (read-only)**. The community is stored encrypted with the operating system's key store.
 
-- **Physical topology**: switch ports, LLDP neighbours (typed from their announced capabilities
-  when the description is not recognised), MAC address tables (including the IEEE 802.1Q tables
+- **Physical topology**: switch ports, LLDP and CDP neighbours (typed from their announced
+  capabilities when the description is not recognised), MAC address tables (including the IEEE 802.1Q tables
   and MAC tables that number ports by position), ARP tables (with the `ipNetToPhysical`
   fallback), PoE, and port names such as `Gi1/0/43` or `1/1/28`.
 - Every device placed on the switch port where it was learned, or behind the access point or
   unmanaged segment it sits on. A link that no switch has confirmed is drawn dashed as
   **assumed**, never presented as fact.
-- **VLANs (802.1Q)**: names, access and tagged ports. Cables take their VLAN's colour and trunks
-  are striped with the VLANs they carry. Router VLAN subinterfaces are named on their network.
+- **VLANs (802.1Q)**: names, access and tagged ports, also from the Cisco VLAN tables on switches
+  that publish them only there. Cables take their VLAN's colour and trunks are striped with the
+  VLANs they carry, labelled in switch notation (`U10` for an access port, `U1 T10,20,99` for a
+  trunk). Router VLAN subinterfaces are shown on their cable and as VLAN chips on the router.
+  Choosing a VLAN highlights the router, cables and devices that belong to it.
+- Two cables between the same two devices are drawn separately. A link whose two ends disagree
+  on native VLAN or duplex raises a warning on the map and a finding in the report.
 - **Loops and spanning tree**: port states are read over SNMP. Redundant cables are drawn dotted,
   with the port spanning tree blocks. A ring with no blocked port, or a switch that hears its own
   addresses on two ports, raises a warning with the ports to unplug.
@@ -117,6 +122,13 @@ The map is drawn automatically from scans and from switches and routers read ove
   routes and forwarding, so a remote network scanned through a VPN is drawn like a local one.
   Routers show their internet interface and every other network on its own port, VLAN or VPN
   interface.
+- **Ways out**: each router's default route is followed. A network with several sites draws each
+  router with its own internet, side by side and joined by their link or tunnel; a site that
+  leaves through another hangs from it. A firewall or modem that is not managed heads the map
+  when the scan found it.
+- Networks the routers hold that were not scanned are listed beside the map with a **Scan**
+  button, which adds what is found to the same network. The computer running Meshwork is marked
+  "You are here".
 - A router or switch with several addresses appears once. Layer 3 switches are recognised.
 - Virtualisation hosts are drawn on their switch port with their virtual machines grouped under
   them.
@@ -174,10 +186,9 @@ the first scan.
 
 In short (details, and what is deliberately out of scope, in [ROADMAP.md](ROADMAP.md)):
 
-- **Next (0.5.21):** Wi-Fi extenders that rewrite client MAC addresses placed correctly on the
+- **Next (0.5.22):** Wi-Fi extenders that rewrite client MAC addresses placed correctly on the
   map, signed Windows installers, and the Mac App Store edition.
-- **0.6:** SNMPv3 (all security levels and protocols), CDP neighbours, parallel cables drawn
-  separately, and a public build pipeline.
+- **0.6:** SNMPv3 (all security levels and protocols) and a public build pipeline.
 - **0.7:** VRFs, tunnels (GRE, IPsec, WireGuard, VXLAN) and link aggregation on the map.
 - **0.8:** a documented fingerprint rule format the community can contribute to, and a
   regression suite of reference topologies.

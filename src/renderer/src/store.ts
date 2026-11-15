@@ -64,6 +64,8 @@ interface State {
   removeRun(id: string): Promise<void>;
   load(): Promise<void>;
   startScan(): Promise<void>;
+  /** Scans `targets` with the current settings and adds what is found to an existing network. */
+  scanInto(networkId: string, targets: string): Promise<void>;
   cancelScan(): Promise<void>;
   removeAsset(id: string): Promise<void>;
   toast(kind: Toast['kind'], text: string): void;
@@ -196,6 +198,23 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
+  scanInto: async (networkId, targets) => {
+    const { settings, scan } = get();
+    if (scan.running) {
+      get().toast('info', 'A scan is already running. Try again when it finishes.');
+      return;
+    }
+    try {
+      set({ scan: { running: true, seen: [], progress: undefined } });
+      const { runId } = await window.api.scan.start({ ...settings, targets, intoNetwork: networkId });
+      set((s) => ({ scan: { ...s.scan, runId } }));
+    } catch (err) {
+      const message = cleanError(err);
+      set({ scan: { running: false, seen: [], error: message } });
+      get().toast('error', message);
+    }
+  },
+
   cancelScan: async () => {
     const { runId } = get().scan;
     if (runId) await window.api.scan.cancel(runId);
@@ -254,6 +273,12 @@ export const useStore = create<State>((set, get) => ({
       }
       case 'done': {
         const s = event.summary;
+        if (s.discarded) {
+          // The network was deleted while the scan ran: the scan ends with nothing saved or listed.
+          set((st) => ({ scan: { ...st.scan, running: false, networkId: undefined, seen: [] } }));
+          get().toast('info', 'Scan stopped: its network was deleted.');
+          return;
+        }
         set((st) => ({ scan: { ...st.scan, running: false, summary: s }, runs: [s, ...st.runs.filter((r) => r.runId !== s.runId)] }));
         const where = get().networks.find((n) => n.id === s.networkId)?.name;
         get().toast(

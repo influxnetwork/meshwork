@@ -58,6 +58,8 @@ function NetworkCard({
   onDelete: () => void;
 }) {
   const rename = useStore((s) => s.renameNetwork);
+  // A network cannot be deleted while a scan is saving devices to it.
+  const scanning = useStore((s) => s.scan.running && s.scan.networkId === network.id);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(network.name);
   const Icon = isLocal(network) ? Router : Globe;
@@ -122,7 +124,13 @@ function NetworkCard({
         >
           <Pencil className="icon" />
         </button>
-        <button className="icon-btn danger" aria-label={`Delete ${network.name}`} title="Delete network" onClick={onDelete}>
+        <button
+          className="icon-btn danger"
+          aria-label={`Delete ${network.name}`}
+          title={scanning ? 'A scan is running on this network. Stop it or wait for it to finish to delete the network.' : 'Delete network'}
+          disabled={scanning}
+          onClick={onDelete}
+        >
           <Trash2 className="icon" />
         </button>
       </div>

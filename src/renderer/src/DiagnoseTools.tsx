@@ -703,7 +703,7 @@ function ServerPort({ offer }: { offer: DhcpOfferResult }) {
       {w.gatewayPort && <div className="muted">This port leads to the gateway: the server is plugged into the gateway itself or a switch next to it</div>}
       {w.unmanaged && <div className="muted">Behind an unmanaged switch on this port</div>}
       {w.beyond && <div className="muted">Past this port, behind a switch without SNMP</div>}
-      {loc.confidence === 'announced' && <div className="muted">It announced itself on this port (LLDP)</div>}
+      {loc.confidence === 'announced' && <div className="muted">It announced itself on this port (LLDP or CDP)</div>}
       {loc.confidence === 'likely' && <div className="muted">Most likely: the only new device on the switches</div>}
       {loc.confidence === 'recorded' && <div className="muted">Identified by the MAC address an earlier scan found at its address</div>}
     </div>

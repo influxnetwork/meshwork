@@ -278,6 +278,27 @@ export class Inventory {
     return toNetwork(this.networkRow('select * from networks where id = ?', id) as NetworkRow);
   }
 
+  /**
+   * Adds scanned ranges to a network, for a scan run into it. A network known by its ranges keeps
+   * being found by the whole set; one known by its router keeps its identity. Undefined when the
+   * network does not exist.
+   */
+  extendNetwork(id: string, ranges: string): Network | undefined {
+    const row = this.networkRow('select * from networks where id = ?', id);
+    if (!row) return undefined;
+    const now = new Date().toISOString();
+    if (row.fingerprint.startsWith('range:')) {
+      const have = row.cidr.split(',').map((r) => r.trim()).filter(Boolean);
+      const added = ranges.split(',').map((r) => r.trim()).filter((r) => r && !have.includes(r));
+      const cidr = [...have, ...added].join(', ');
+      const fingerprint = `range:${cidr}`;
+      const taken = added.length ? this.networkRow('select * from networks where fingerprint = ? and id <> ?', fingerprint, id) : undefined;
+      if (added.length && !taken) this.db.prepare('update networks set cidr = ?, fingerprint = ? where id = ?').run(cidr, fingerprint, id);
+    }
+    this.db.prepare('update networks set last_scan_at = ? where id = ?').run(now, id);
+    return toNetwork(this.networkRow('select * from networks where id = ?', id) as NetworkRow);
+  }
+
   networks(): Network[] {
     return (this.db.prepare('select * from networks order by last_scan_at desc').all() as unknown as NetworkRow[]).map(toNetwork);
   }

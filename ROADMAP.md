@@ -7,7 +7,7 @@ something more urgent.
 Meshwork is a tool for on-site work: it reads a network, explains it and documents it. That
 decides what goes on this list and what stays off it.
 
-## Next: 0.5.21
+## Next: 0.5.22
 
 - **Wi-Fi extenders that translate MAC addresses.** Some extenders rewrite the MAC address of
   every client behind them, so switches learn addresses that match no real device. Meshwork will
@@ -25,9 +25,6 @@ decides what goes on this list and what stays off it.
   with MD5, SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512; privacy with DES, AES-128 and both
   AES-256 key-extension variants. Engine ID discovery, and clear messages for each v3 error
   (unknown user, wrong digest, decryption failure, time window). v2c stays available.
-- **CDP neighbours** alongside LLDP, for networks where LLDP is off.
-- **Parallel cables** between the same two devices drawn separately; today they are drawn as
-  one link.
 - **Public build pipeline**: every pull request builds and runs the test suite on macOS and
   Windows.
 

@@ -121,6 +121,7 @@ export async function readGear(ip: string, community: string): Promise<GearDevic
       lldpLocPortId: await walk(session, OID.lldpLocPortId, pace),
       lldpRem: await walk(session, OID.lldpRem, pace),
       lldpRemManAddr: await walk(session, OID.lldpRemManAddr, pace),
+      cdpCache: await walk(session, OID.cdpCache, pace),
       pethPortDetection: await walk(session, OID.pethPortDetection, pace),
       pethMain: await walk(session, OID.pethMain, pace),
       poePortMilliwatts: await walk(session, OID.poePortMilliwattsSb, pace),
@@ -134,6 +135,20 @@ export async function readGear(ip: string, community: string): Promise<GearDevic
       w.ieeeVlanStaticEgress = await walk(session, OID.ieeeVlanStaticEgress, pace);
       w.ieeeVlanStaticUntagged = await walk(session, OID.ieeeVlanStaticUntagged, pace);
     }
+    // Cisco switches that publish no 802.1Q tables at all: their own VLAN tables.
+    const noVlans = [w.vlanStaticName, w.pvid, w.vlanCurrentEgress, w.vlanStaticEgress, w.ieeeVlanStaticName, w.ieeePvid, w.ieeeVlanStaticEgress].every((x) => !x?.length);
+    if (noVlans) {
+      w.ciscoVlanName = await walk(session, OID.ciscoVlanName, pace);
+      if (w.ciscoVlanName.length) {
+        w.ciscoTrunkStatus = await walk(session, OID.ciscoTrunkStatus, pace);
+        w.ciscoTrunkNative = await walk(session, OID.ciscoTrunkNative, pace);
+        w.ciscoTrunkVlans = [];
+        for (const oid of [OID.ciscoTrunkVlans1k, OID.ciscoTrunkVlans2k, OID.ciscoTrunkVlans3k, OID.ciscoTrunkVlans4k]) w.ciscoTrunkVlans.push(...(await walk(session, oid, pace)));
+        w.ciscoAccessVlan = await walk(session, OID.ciscoAccessVlan, pace);
+      }
+    }
+    // Port duplex is compared with what CDP neighbours announce, so it is read only when there are some.
+    if (w.cdpCache?.length) w.dot3Duplex = await walk(session, OID.dot3Duplex, pace);
     // Switches that do not publish per-port watts one way may publish them the other.
     if (!w.poePortMilliwatts.length && w.pethPortDetection.length) w.poePortMilliwatts = await walk(session, OID.poePortMilliwattsCisco, pace);
     if (!w.qFdbPort.length) {

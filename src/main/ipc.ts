@@ -104,6 +104,7 @@ function validateSettings(input: unknown): ScanSettings {
     customPorts,
     timing: s.timing as ScanSettings['timing'],
     resolveNames: s.resolveNames !== false,
+    intoNetwork: typeof s.intoNetwork === 'string' && /^[\w-]{1,64}$/.test(s.intoNetwork) ? s.intoNetwork : undefined,
   };
 }
 
@@ -176,7 +177,10 @@ export function registerIpc(getWindow: () => BrowserWindow | undefined, inventor
 
   ipcMain.handle('inventory:list', () => inventory.list());
   ipcMain.handle('inventory:remove', (_e, id: unknown) => inventory.remove(String(id)));
-  ipcMain.handle('inventory:clear', () => inventory.clear());
+  ipcMain.handle('inventory:clear', () => {
+    inventory.clear();
+    scanner.inventoryCleared();
+  });
   ipcMain.handle('inventory:runs', () => inventory.runs());
   ipcMain.handle('inventory:networks', () => inventory.networks());
   ipcMain.handle('inventory:renameNetwork', (_e, id: unknown, name: unknown) => {
@@ -184,7 +188,10 @@ export function registerIpc(getWindow: () => BrowserWindow | undefined, inventor
     if (!clean || clean.length > 80) throw new Error('Network names must be 1 to 80 characters.');
     return inventory.renameNetwork(String(id), clean);
   });
-  ipcMain.handle('inventory:removeNetwork', (_e, id: unknown) => inventory.removeNetwork(String(id)));
+  ipcMain.handle('inventory:removeNetwork', (_e, id: unknown) => {
+    inventory.removeNetwork(String(id));
+    scanner.networkRemoved(String(id));
+  });
   ipcMain.handle('inventory:removeRun', (_e, id: unknown) => inventory.removeRun(String(id)));
   ipcMain.handle('inventory:exportCsv', async (_e, ids: unknown) => {
     // Ids arrive in the order shown on screen; a full export with no ids is ordered by IP.

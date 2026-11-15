@@ -37,6 +37,8 @@ export interface ScanSettings {
   customPorts: string;
   timing: Timing;
   resolveNames: boolean;
+  /** Id of a network the devices found are added to, whatever ranges are scanned. */
+  intoNetwork?: string;
 }
 
 export const DEFAULT_SETTINGS: ScanSettings = {
@@ -164,6 +166,8 @@ export interface ScanSummary {
   macHidden?: boolean;
   /** True when a local scan reached no device but this computer (the OS blocked local network traffic). */
   lanBlocked?: boolean;
+  /** True when the scan was stopped because its network was deleted while it ran; nothing of it was saved. */
+  discarded?: boolean;
 }
 
 export type ScanEvent =
@@ -264,7 +268,11 @@ export interface GearInterface {
   mac?: string;
   /** Spanning tree state of the port, when the switch reports it. */
   stp?: StpState;
+  /** Duplex the port negotiated (EtherLike-MIB), when the device reports it. */
+  duplex?: Duplex;
 }
+
+export type Duplex = 'half' | 'full';
 
 /** A VLAN configured on a managed switch. */
 export interface GearVlan {
@@ -272,11 +280,22 @@ export interface GearVlan {
   name?: string;
 }
 
-/** A device announced by LLDP on one of a managed device's ports. */
-/** System capabilities a neighbour announces over LLDP (IEEE 802.1AB). */
+/** System capabilities a neighbour announces over LLDP (IEEE 802.1AB); CDP capabilities are mapped onto them. */
 export type LldpCapability = 'other' | 'repeater' | 'bridge' | 'wlanAccessPoint' | 'router' | 'telephone' | 'docsis' | 'station';
 
+/** Neighbour discovery protocols a managed device reports neighbours from. */
+export type NeighborProtocol = 'lldp' | 'cdp';
+
+/** A device announced over LLDP or CDP on one of a managed device's ports. */
 export interface GearNeighbor {
+  /** Protocols the neighbour was heard on; one entry when both announce the same device. */
+  protocols?: NeighborProtocol[];
+  /** Hardware platform it announces over CDP, e.g. "cisco WS-C2960X-24PS-L". */
+  platform?: string;
+  /** Native (untagged) VLAN of its port, as it announces over CDP. */
+  nativeVlan?: number;
+  /** Duplex of its port, as it announces over CDP. */
+  duplex?: Duplex;
   localIfIndex?: number;
   localPort: string;
   /** Chassis MAC address, when the chassis is identified by one. */

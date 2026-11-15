@@ -35,7 +35,8 @@ function isSelf(d: GearDevice, n: GearNeighbor): boolean {
   }
   if (n.chassisMac && d.mac) return false;
   // Only a name to go by: trusted when nothing else identifies the neighbour.
-  return !!n.sysName && !!d.sysName && !n.chassisId && norm(n.sysName) === norm(d.sysName);
+  // CDP identifies a device by its name, so there the chassis id is the name.
+  return !!n.sysName && !!d.sysName && (!n.chassisId || n.chassisId === n.sysName) && norm(n.sysName) === norm(d.sysName);
 }
 
 /** The switch's own port that a neighbour names as its remote port ("gi1", "GigabitEthernet1", an alias). */

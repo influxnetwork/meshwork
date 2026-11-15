@@ -364,19 +364,24 @@ function ObservedRows({ asset }: { asset: Asset }) {
   );
 }
 
-/** What a device says about itself over SNMP or LLDP, shown in the drawer when the map knows it. */
+/** "read over SNMP" or "announced over LLDP / CDP": where the facts about a device came from. */
+export function gearVia(source: GearFacts['source']): string {
+  return source === 'snmp' ? 'read over SNMP' : `announced over ${source.toUpperCase()}`;
+}
+
+/** What a device says about itself over SNMP, LLDP or CDP, shown in the drawer when the map knows it. */
 export interface GearFacts {
   name?: string;
   /** Type the map gives the device (a switch read over SNMP, an access point that announced itself). */
   type?: DeviceType;
   description?: string;
-  source: 'snmp' | 'lldp';
+  source: 'snmp' | 'lldp' | 'cdp';
 }
 
-/** Model, firmware, announced name and full description from SNMP or LLDP. */
+/** Model, firmware, announced name and full description from SNMP, LLDP or CDP. */
 export function GearRows({ gear }: { gear: GearFacts }) {
   const { model, firmware } = parseDeviceModel(gear.description);
-  const via = gear.source === 'snmp' ? 'read over SNMP' : 'announced over LLDP';
+  const via = gearVia(gear.source);
   return (
     <>
       {gear.description !== undefined && (
@@ -459,7 +464,7 @@ export function Detail({
   };
 
   const top = asset.risks[0];
-  // What a device reports about itself over SNMP or LLDP beats the scan's guess, as on the map.
+  // What a device reports about itself over SNMP, LLDP or CDP beats the scan's guess, as on the map.
   const type = gear?.type && gear.type !== 'unknown' ? gear.type : asset.type;
   return (
     <aside className={className ? `detail ${className}` : 'detail'} aria-label="Device details">
@@ -616,7 +621,7 @@ export function Detail({
           <dd>
             {typeLabel(type)}
             {type !== asset.type ? (
-              <span className="muted"> · {gear?.source === 'snmp' ? 'read over SNMP' : 'announced over LLDP'}</span>
+              <span className="muted"> · {gear ? gearVia(gear.source) : ''}</span>
             ) : (
               asset.typeConfidence > 0 && <span className="muted"> · {Math.round(asset.typeConfidence * 100)}% confidence</span>
             )}
@@ -647,7 +652,7 @@ export function Detail({
             <div className="section-title">Why this type</div>
             <ul className="evidence">
               <li>
-                {gear?.source === 'snmp' ? 'reports itself' : 'announces itself over LLDP'} as {typeLabel(type).toLowerCase()}
+                {gear?.source === 'snmp' ? 'reports itself' : `announces itself over ${(gear?.source ?? 'lldp').toUpperCase()}`} as {typeLabel(type).toLowerCase()}
               </li>
               {asset.type !== 'unknown' && <li className="muted">the scan alone guessed {typeLabel(asset.type).toLowerCase()}</li>}
             </ul>
