@@ -7,14 +7,8 @@ something more urgent.
 Meshwork is a tool for on-site work: it reads a network, explains it and documents it. That
 decides what goes on this list and what stays off it.
 
-## Next: 0.5.22
+## Next: 0.5.23
 
-- **Wi-Fi extenders that translate MAC addresses.** Some extenders rewrite the MAC address of
-  every client behind them, so switches learn addresses that match no real device. Meshwork will
-  recognise that pattern from its structure, not from a vendor list. It will place the extender
-  under its access point and its clients under the extender. The pattern has been seen on one
-  extender model so far; reports from other models are welcome. Extenders that hash or
-  randomise client addresses cannot be undone, so their clients stay drawn as assumed.
 - **Signed Windows installers**, so Windows no longer warns on first run.
 - **Mac App Store edition** (sandboxed, universal binary) alongside the direct download; it is
   in review.
@@ -35,8 +29,6 @@ decides what goes on this list and what stays off it.
 - **Tunnels as logical links**: GRE, IPsec tunnel interfaces, WireGuard and VXLAN interfaces
   drawn between their two ends when both ends are known to Meshwork. A tunnel to an unknown peer
   is shown as leaving the network.
-- **Link aggregation**: LACP and static port-channel members drawn as one bundle with the
-  member ports listed.
 
 ## 0.8: identification the community can extend
 

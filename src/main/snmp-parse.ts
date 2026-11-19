@@ -22,6 +22,7 @@ export const OID = {
   ifHCInOctets: '1.3.6.1.2.1.31.1.1.1.6',
   ifHCOutOctets: '1.3.6.1.2.1.31.1.1.1.10',
   ifHighSpeed: '1.3.6.1.2.1.31.1.1.1.15',
+  ifStackStatus: '1.3.6.1.2.1.31.1.2.1.3',
   ifAlias: '1.3.6.1.2.1.31.1.1.1.18',
   baseBridgeAddress: '1.3.6.1.2.1.17.1.1.0',
   basePortIfIndex: '1.3.6.1.2.1.17.1.4.1.2',
@@ -169,6 +170,11 @@ const STP_STATES: readonly (StpState | undefined)[] = [undefined, 'disabled', 'b
 
 export function macOf(v: unknown): string | undefined {
   if (Buffer.isBuffer(v) && v.length === 6) return [...v].map((b) => b.toString(16).padStart(2, '0')).join(':');
+  // Some agents give the address written out ("AA:00:00:00:00:02") in the bytes of the value.
+  if (Buffer.isBuffer(v) && v.length >= 12 && v.length <= 17) {
+    const written = v.toString('latin1');
+    return /^[0-9a-f]{2}([:.-]?[0-9a-f]{2}){5}$/i.test(written) ? macOf(written) : undefined;
+  }
   if (typeof v === 'string') {
     const hex = v.replace(/[^0-9a-f]/gi, '');
     if (hex.length === 12) return hex.toLowerCase().match(/../g)?.join(':');
@@ -206,6 +212,8 @@ export interface GearWalks {
   ifAlias: Varbind[];
   ifOperStatus: Varbind[];
   ifHighSpeed: Varbind[];
+  /** Which interface runs over which (IF-MIB ifStackTable); older readings lack it. */
+  ifStack?: Varbind[];
   basePortIfIndex: Varbind[];
   qFdbPort: Varbind[];
   qFdbStatus: Varbind[];
@@ -274,6 +282,25 @@ export function parseGear(ip: string, w: GearWalks): GearDevice {
       };
     });
   const byIndex = new Map(interfaces.map((i) => [i.ifIndex, i]));
+
+  // Link bundles: an interface that runs over two or more ports which carry nothing else. A port
+  // that several interfaces run over carries subinterfaces instead, and is no member of a bundle.
+  const over = new Map<number, number[]>(); // port → the interfaces that run over it
+  const under = new Map<number, number[]>(); // interface → the ports it runs over
+  for (const key of column(w.ifStack ?? [], OID.ifStackStatus).keys()) {
+    const parts = key.split('.').map(Number);
+    const [higher, lower] = parts;
+    if (parts.length !== 2 || !higher || !lower) continue;
+    over.set(lower, [...(over.get(lower) ?? []), higher]);
+    under.set(higher, [...(under.get(higher) ?? []), lower]);
+  }
+  for (const [higher, ports] of under) {
+    if (ports.length < 2 || !byIndex.has(higher) || ports.some((p) => over.get(p)?.length !== 1)) continue;
+    for (const p of ports) {
+      const member = byIndex.get(p);
+      if (member) member.memberOf = higher;
+    }
+  }
   const byName = new Map<string, GearInterface>();
   for (const i of interfaces) {
     byName.set(i.name.toLowerCase(), i);
@@ -364,9 +391,11 @@ export function parseGear(ip: string, w: GearWalks): GearDevice {
   const neighbors: GearNeighbor[] = [];
   for (const [key, cols] of remote) {
     const localPortNum = Number(key.split('.')[0]);
-    const local = localPortToIf(localPortNum);
     const chassisMac = num(cols.get(4)) === 4 ? macOf(cols.get(5)) : undefined;
     const portMac = num(cols.get(6)) === 3 ? macOf(cols.get(7)) : undefined;
+    // A table that names no local port (port number 0): the port where the neighbour's address was learned.
+    const learnedOn = localPortNum ? undefined : fdb.find((f) => f.ifIndex !== undefined && (f.mac === chassisMac || f.mac === portMac))?.ifIndex;
+    const local = localPortToIf(localPortNum) ?? (learnedOn !== undefined ? byIndex.get(learnedOn) : undefined);
     neighbors.push({
       localIfIndex: local?.ifIndex,
       localPort: local?.name ?? `port ${localPortNum}`,

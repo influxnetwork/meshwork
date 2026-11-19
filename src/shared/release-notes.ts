@@ -6,6 +6,19 @@ export interface ReleaseNote {
 
 export const RELEASE_NOTES: ReleaseNote[] = [
   {
+    version: '0.5.22',
+    notes: [
+      'Redundant gateways: a router that holds a gateway address it shares with others (HSRP, VRRP, GLBP) says so on its card, with the address, the protocol and whether it answers for it. The shared address is no longer drawn as a device of its own.',
+      'Link bundles are drawn as one link, named with the ports it is made of, instead of one redundant link per cable. Switches cabled to two cores stand under both, their cables no longer run over each other, and the label in the middle of a cable stays on its cable.',
+      'Switches that announce no neighbours are placed from the addresses they learned, in a row or behind an access switch with two uplinks, instead of all hanging from the gateway. A cable only one end of which heard the other is drawn once. A Wi-Fi extender that rewrites the addresses behind it is drawn under the access point it repeats.',
+      'A router that answers on several addresses is one device. Devices on the network a router leaves through are drawn beside it, and a switch heard on that port is drawn above it, where it really is.',
+      'More switches are read in full: one that gives no answer at all for the tables it lacks no longer loses its neighbours, VLANs and PoE; one that answers only single requests is read row by row; neighbours announced without a port, or with their address written as text, are placed correctly.',
+      'Network equipment has icons of its own: router, switch, switch that routes between its networks, firewall and access point. A switch with a loop says so on its card.',
+      'The VLANs of a trunk are shown again beside its port name on the cable; they had gone missing in 0.5.21.',
+      'Scanning a routed network again no longer stops with an error when several addresses share a MAC address. A scan pings once more the addresses that stayed silent beside one that answered. When one target makes a scan too large, the message names it.',
+    ],
+  },
+  {
     version: '0.5.21',
     notes: [
       'Cisco neighbours: devices announced over CDP are drawn alongside those announced over LLDP, with their name, address, platform and type. A link whose two ends disagree on native VLAN or duplex raises a warning on the map and a finding in the report.',

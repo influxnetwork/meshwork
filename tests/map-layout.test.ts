@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DeviceType } from '@shared/types';
-import { BANK_MIN, WRAP_MIN, bankSiblings, connectionRows, layoutTree, neighbourType, type MapEdge, type MapNode, type Topology } from '../src/renderer/src/map-model';
+import { BANK_MIN, WRAP_MIN, attachLinks, bankSiblings, connectionRows, layoutTree, neighbourType, type Box, type MapEdge, type MapNode, type Topology } from '../src/renderer/src/map-model';
 
 const edge = (source: string, target: string, extra: Partial<MapEdge> = {}): MapEdge => ({ id: `${source}->${target}`, source, target, inferred: false, ...extra });
 
@@ -128,6 +128,103 @@ describe('layout never overlaps', () => {
       const ms = t.nodes.filter((x) => x.parent === g.id).map((m) => ({ ...(positions[m.id] as { x: number; y: number }), ...(sizes[m.id] as { w: number; h: number }) }));
       for (const m of ms) expect(m.x >= 0 && m.y >= 0 && m.x + m.w <= gs.w + 0.5 && m.y + m.h <= gs.h + 0.5, `seed ${seed}: member outside ${g.id}`).toBe(true);
     }
+  });
+});
+
+describe('switches cabled to two devices of the row above', () => {
+  const card = (id: string): MapNode => ({ id, kind: 'device' });
+  const link = (source: string, target: string): MapEdge => ({ id: `${source}->${target}`, source, target, inferred: false });
+  const centre = (l: ReturnType<typeof layoutTree>, id: string) => (l.positions[id]?.x ?? NaN) + (l.sizes[id]?.w ?? NaN) / 2;
+  const nodes = [{ id: 'internet', kind: 'internet' } as MapNode, ...['r', 'c1', 'c2', 'a1', 'a2'].map(card)];
+  const tree = [link('internet', 'r'), link('r', 'c1'), link('r', 'c2'), link('c1', 'a1'), link('c1', 'a2')];
+  const second = [{ ...link('c2', 'a1'), id: 'c2~a1' }, { ...link('a2', 'c2'), id: 'a2~c2' }];
+
+  it('stand under the two they are cabled to, one under each, on one level', () => {
+    const l = layoutTree({ nodes, edges: tree, confirmed: true, redundant: second });
+    expect(centre(l, 'a1')).toBeCloseTo(centre(l, 'c1'), 5);
+    expect(centre(l, 'a2')).toBeCloseTo(centre(l, 'c2'), 5);
+    expect(l.positions.a1?.y).toBe(l.positions.a2?.y);
+    expect(l.positions.c1?.y).toBe(l.positions.c2?.y);
+    // The same whichever of the two carries the traffic, and whichever side it is on.
+    const mirrored = layoutTree({ nodes, edges: [link('internet', 'r'), link('r', 'c1'), link('r', 'c2'), link('c2', 'a1'), link('c2', 'a2')], confirmed: true, redundant: [{ ...link('c1', 'a1'), id: 'c1~a1' }, { ...link('c1', 'a2'), id: 'c1~a2' }] });
+    expect(centre(mirrored, 'a1')).toBeCloseTo(centre(mirrored, 'c1'), 5);
+    expect(centre(mirrored, 'a2')).toBeCloseTo(centre(mirrored, 'c2'), 5);
+  });
+
+  it('are drawn with no cable over another, and one crossing where the two that change sides meet', () => {
+    const l = layoutTree({ nodes, edges: tree, confirmed: true, redundant: second });
+    const boxes = new Map<string, Box>(Object.keys(l.positions).map((id) => [id, { ...(l.positions[id] as { x: number; y: number }), ...(l.sizes[id] as { w: number; h: number }) }]));
+    const at = attachLinks(boxes, [...tree, ...second]);
+    const lines = [...at].flatMap(([id, a]) => {
+      const turn = a.turn ?? (a.sy + a.ty) / 2;
+      return [
+        { id, level: false, at: a.sx, from: Math.min(a.sy, turn), to: Math.max(a.sy, turn) },
+        ...(Math.abs(a.sx - a.tx) > 1 ? [{ id, level: true, at: turn, from: Math.min(a.sx, a.tx), to: Math.max(a.sx, a.tx) }] : []),
+        { id, level: false, at: a.tx, from: Math.min(turn, a.ty), to: Math.max(turn, a.ty) },
+      ];
+    });
+    const pairs = lines.flatMap((p, i) => lines.slice(i + 1).filter((q) => q.id !== p.id).map((q) => [p, q] as const));
+    const covering = pairs.filter(([p, q]) => p.level === q.level && Math.abs(p.at - q.at) < 8 && Math.min(p.to, q.to) - Math.max(p.from, q.from) > 4);
+    expect(covering).toEqual([]);
+    const cross = (p: (typeof lines)[number], q: (typeof lines)[number]) => p.level !== q.level && p.at > q.from + 1 && p.at < q.to - 1 && q.at > p.from + 1 && q.at < p.to - 1;
+    const crossings = pairs.filter(([p, q]) => ![p.id, q.id].includes('internet->r') && cross(p, q));
+    expect(crossings.map(([p, q]) => [p.id, q.id].sort().join(' x '))).toEqual(['c1->a2 x c2~a1']);
+  });
+
+  it('are spread towards the second one also when the first has a switch of its own beside them', () => {
+    const all = [...nodes, card('a5')];
+    // a5 hangs from c1 alone, on the side away from c2: it and a1 stay under c1, a2 goes under c2.
+    const far = [...tree.slice(0, 3), link('c1', 'a5'), ...tree.slice(3)];
+    const plain = layoutTree({ nodes: all, edges: far, confirmed: true });
+    const l = layoutTree({ nodes: all, edges: far, confirmed: true, redundant: second });
+    expect(centre(plain, 'a5')).toBeLessThan(centre(plain, 'a1'));
+    expect(centre(l, 'a5')).toBeCloseTo(centre(plain, 'a5'), 5);
+    expect(centre(l, 'a1')).toBeCloseTo(centre(plain, 'a1'), 5);
+    expect(centre(l, 'a2')).toBeCloseTo(centre(l, 'c2'), 5);
+    expect(new Set(['a1', 'a2', 'a5'].map((id) => l.positions[id]?.y)).size).toBe(1);
+    // a5 between the others and c2: moving them would carry them over it, so nothing moves sideways.
+    const between = [...tree, link('c1', 'a5')];
+    const still = layoutTree({ nodes: all, edges: between, confirmed: true });
+    const kept = layoutTree({ nodes: all, edges: between, confirmed: true, redundant: second });
+    for (const id of ['a1', 'a2', 'a5']) expect(centre(kept, id)).toBeCloseTo(centre(still, id), 5);
+  });
+
+  it('are placed the same whatever order the links are listed in, also over three levels', () => {
+    const more = [...nodes, card('e1'), card('e2')];
+    const links = [...tree, link('a1', 'e1'), link('a1', 'e2')];
+    const extra = [...second, { ...link('a2', 'e1'), id: 'a2~e1' }, { ...link('a2', 'e2'), id: 'a2~e2' }];
+    const one = layoutTree({ nodes: more, edges: links, confirmed: true, redundant: extra });
+    const other = layoutTree({ nodes: more, edges: [links[0] as MapEdge, ...links.slice(1).reverse()], confirmed: true, redundant: [...extra].reverse() });
+    const centres = (l: ReturnType<typeof layoutTree>) => Object.fromEntries(['c1', 'c2', 'a1', 'a2', 'e1', 'e2'].map((id) => [id, [Math.round(centre(l, id)), l.positions[id]?.y]]));
+    expect(centres(one).e1?.[1]).toBe(centres(one).e2?.[1]);
+    expect(Math.round(centre(one, 'e1'))).toBe(Math.round(centre(one, 'a1')));
+    expect(Math.round(centre(one, 'e2'))).toBe(Math.round(centre(one, 'a2')));
+    expect(Object.values(centres(other)).map((c) => c[1]).sort()).toEqual(Object.values(centres(one)).map((c) => c[1]).sort());
+  });
+
+  it('take what hangs from them along', () => {
+    const l = layoutTree({ nodes: [...nodes, card('a3')], edges: [...tree, link('a2', 'a3')], confirmed: true, redundant: second });
+    expect(centre(l, 'a2')).toBeCloseTo(centre(l, 'c2'), 5);
+    expect(centre(l, 'a3')).toBeCloseTo(centre(l, 'a2'), 5);
+  });
+
+  it('one alone stands between the two', () => {
+    const l = layoutTree({ nodes: nodes.filter((n) => n.id !== 'a2'), edges: tree.filter((e) => e.target !== 'a2'), confirmed: true, redundant: [second[0] as MapEdge] });
+    expect(centre(l, 'a1')).toBeCloseTo((centre(l, 'c1') + centre(l, 'c2')) / 2, 5);
+  });
+
+  it('stay under the one that carries their traffic when the other has devices of its own below it, or only some are cabled to both', () => {
+    const plain = layoutTree({ nodes: [...nodes, card('x')], edges: [...tree, link('c2', 'x')], confirmed: true });
+    const busy = layoutTree({ nodes: [...nodes, card('x')], edges: [...tree, link('c2', 'x')], confirmed: true, redundant: second });
+    expect(busy.positions).toEqual(plain.positions);
+    const some = layoutTree({ nodes, edges: tree, confirmed: true, redundant: [second[0] as MapEdge] });
+    expect(some.positions).toEqual(layoutTree({ nodes, edges: tree, confirmed: true }).positions);
+  });
+
+  it('never land on another card', () => {
+    const wide = layoutTree({ nodes: [...nodes, ...['a3', 'a4', 'a5', 'z'].map(card)], edges: [...tree, link('a2', 'a3'), link('a2', 'a4'), link('a2', 'a5'), link('r', 'z')], confirmed: true, redundant: second });
+    const boxes = Object.keys(wide.positions).map((id) => ({ id, ...(wide.positions[id] as { x: number; y: number }), ...(wide.sizes[id] as { w: number; h: number }) }));
+    for (const [i, a] of boxes.entries()) for (const b of boxes.slice(i + 1)) expect(a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h, `${a.id} on ${b.id}`).toBe(false);
   });
 });
 

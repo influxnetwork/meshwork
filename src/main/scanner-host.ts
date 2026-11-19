@@ -19,6 +19,8 @@ export class ScannerHost {
   private runNetwork = new Map<string, string>();
   /** Runs whose devices go into a chosen network: run id → network id. */
   private runInto = new Map<string, string>();
+  /** Ranges of each scan run into a chosen network, remembered for the network when the scan finishes. */
+  private runRanges = new Map<string, string>();
   /** Runs whose results are thrown away because their network, or the whole inventory, was deleted mid-scan. */
   private discarded = new Set<string>();
 
@@ -52,6 +54,7 @@ export class ScannerHost {
       this.active.clear();
       this.runNetwork.clear();
       this.runInto.clear();
+      this.runRanges.clear();
       this.discarded.clear();
       this.child = undefined;
     });
@@ -77,6 +80,7 @@ export class ScannerHost {
         // A scan run into a network adds its ranges to it instead of being matched by them.
         const into = this.runInto.get(event.runId);
         this.runInto.delete(event.runId);
+        if (into) this.runRanges.set(event.runId, event.identity.cidr);
         const network = (into ? this.inventory.extendNetwork(into, event.identity.cidr) : undefined) ?? this.inventory.resolveNetwork(event.identity);
         this.runNetwork.set(event.runId, network.id);
         this.send({ type: 'network', runId: event.runId, network });
@@ -96,6 +100,7 @@ export class ScannerHost {
           const runId = event.summary.runId;
           this.runNetwork.delete(runId);
           this.runInto.delete(runId);
+          this.runRanges.delete(runId);
           this.active.delete(runId);
           this.send({ type: 'done', summary: { ...event.summary, networkId: undefined, newAssets: 0, discarded: true } });
           return;
@@ -112,6 +117,12 @@ export class ScannerHost {
           this.send({ type: 'network-removed', networkId: summary.networkId });
           summary.networkId = undefined;
         }
+        // A scan run into a network that reached its end covered its ranges, whoever answered: the
+        // network remembers them. One that was cancelled did not cover them.
+        const ranges = this.runRanges.get(summary.runId);
+        this.runRanges.delete(summary.runId);
+        const covered = ranges && summary.networkId && summary.status === 'done' ? this.inventory.rememberScanned(summary.networkId, ranges) : undefined;
+        if (covered) this.send({ type: 'network', runId: summary.runId, network: covered });
         this.inventory.recordRun(summary);
         this.active.delete(summary.runId);
         this.send({ type: 'done', summary });
@@ -122,6 +133,7 @@ export class ScannerHost {
         this.active.delete(event.runId);
         this.runNetwork.delete(event.runId);
         this.runInto.delete(event.runId);
+        this.runRanges.delete(event.runId);
         this.send(event);
         return;
       default:
@@ -167,6 +179,7 @@ export class ScannerHost {
     this.discarded.add(runId);
     this.runNetwork.delete(runId);
     this.runInto.delete(runId);
+    this.runRanges.delete(runId);
     this.cancel(runId);
   }
 

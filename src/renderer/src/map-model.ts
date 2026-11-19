@@ -8,6 +8,8 @@ import { announcedType } from '@shared/fingerprint';
 import { isVirtualMac } from '@shared/model';
 import { inCidr } from '@shared/report';
 import { followDefaultRoutes } from '@shared/default-routes';
+import { byLastBytes, relaysOnPort, type Relay } from '@shared/relayed-address';
+import { sharedAddressProtocol, withSharedAddresses, type SharedAddressProtocol } from '@shared/shared-address';
 import type { Asset, DeviceType, GearDevice, GearFdbEntry, GearInterface, GearSnapshot, LldpCapability, Network } from '@shared/types';
 
 export type MapNodeKind = 'internet' | 'gateway' | 'device' | 'group';
@@ -22,6 +24,30 @@ export interface RoutedVlan {
   network: string;
   ip: string;
   port: string;
+}
+
+/** A gateway address that routers share, on the router that holds it. */
+export interface SharedGateway {
+  ip: string;
+  protocol: SharedAddressProtocol;
+  network: string;
+  vlan?: number;
+  /** The interface the address is on. */
+  port?: string;
+  /** True when the last reading shows this router, and no other, answering for the address. */
+  active: boolean;
+}
+
+/**
+ * The line a card shows for the shared gateway addresses a router holds: the protocols, "active"
+ * when the router answers for all of them, and the address (the first, and how many more). The
+ * address comes last: it is the part a narrow card can cut short.
+ */
+export function gatewayLine(gateways: SharedGateway[]): string {
+  const [first, ...more] = gateways;
+  if (!first) return '';
+  const protocols = [...new Set(gateways.map((g) => g.protocol))].join('/');
+  return `${protocols}${gateways.every((g) => g.active) ? ' active' : ''} · ${first.ip}${more.length ? ` +${more.length}` : ''}`;
 }
 
 export interface MapNode {
@@ -52,6 +78,13 @@ export interface MapNode {
   typeRead?: boolean;
   /** For a router: the networks it routes on its cabled ports and their VLAN subinterfaces. */
   routes?: RoutedVlan[];
+  /** Gateway addresses this router shares with others and holds, one per network. */
+  gateways?: SharedGateway[];
+  /**
+   * On the gateway node: the gateway address is one that routers share, so the card is drawn like
+   * that of any other device. The routers sharing it are equals, and each says which address it holds.
+   */
+  sharedGateway?: boolean;
   category?: Category;
   /** Devices in a group, shown on the group node (also when it is collapsed). */
   count?: number;
@@ -86,6 +119,8 @@ export interface MapEdge {
   /** Every port behind a group's cable, when `sourcePort` shows only the first. */
   sourcePortsAll?: string;
   targetPort?: string;
+  /** Set on a link bundle (LACP or static): how many cables it is made of and their ports at each end. */
+  bundle?: { cables: number; sourcePorts?: string[]; targetPorts?: string[] };
   speedMbps?: number;
   poe?: boolean;
   poeWatts?: number;
@@ -127,8 +162,8 @@ export interface Topology {
   peers?: MapEdge[];
   /**
    * Cables between gear that is already joined another way: each closes a ring. Spanning tree
-   * normally blocks one port on each. Drawn apart from the tree: they take no part in its node
-   * layout, paths or groups.
+   * normally blocks one port on each. Drawn apart from the tree: they take no part in its paths
+   * or groups, and move nodes only where devices are cabled to two neighbours of the row above.
    */
   redundant?: MapEdge[];
 }
@@ -573,6 +608,14 @@ export function buildTopology(
 ): Topology {
   const b = new Builder(options);
   b.node({ id: INTERNET_ID, kind: 'internet' });
+  // An address several routers share is listed by one of them before anything is drawn: it is
+  // then one more address of that router, like the ones a router reports itself.
+  if (gear?.devices.length) {
+    const macs = new Map<string, string>();
+    for (const d of gear.devices) for (const e of d.arp ?? []) if (!macs.has(e.ip)) macs.set(e.ip, e.mac.toLowerCase());
+    for (const a of assets) if (a.mac) macs.set(a.ip, a.mac.toLowerCase());
+    gear = { ...gear, devices: withSharedAddresses(gear.devices, macs) };
+  }
   // A scan of a remote network does not know its gateway; managed devices do.
   if (!network.gatewayIp && gear?.devices.length) network = { ...network, gatewayIp: gatewayFromGear(gear.devices, network.cidr) };
   const gateway = findGateway(network, assets);
@@ -588,7 +631,10 @@ export function buildTopology(
   };
   if (gear?.devices.length) {
     const drawn = withGear(b, gear.devices, network, gateway, gatewayNode, rest);
-    return bankSiblings(markSelf(drawn.topology, assets, options.self, drawn.holderOf), typeOf, options.collapsed);
+    // This computer, like any device on the network a router's way out passes, goes beside that
+    // router; elsewhere it is held by the router of its network.
+    const holderOf = (ip: string) => drawn.besideOf(ip) ?? drawn.holderOf(ip);
+    return bankSiblings(markSelf(drawn.topology, assets, options.self, holderOf), typeOf, options.collapsed);
   }
 
   const gearAssets = rest
@@ -742,12 +788,23 @@ function withGear(
   gateway: Asset | undefined,
   gatewayNode: string,
   rest: Asset[],
-): { topology: Topology; holderOf: (ip: string) => string | undefined } {
+): { topology: Topology; holderOf: (ip: string) => string | undefined; besideOf: (ip: string) => string | undefined } {
   // Switches' own ARP tables fill in addresses the inventory lacks (when the OS hides them).
   const arpMac = new Map<string, string>();
   for (const d of devices) for (const e of d.arp ?? []) if (!arpMac.has(e.ip)) arpMac.set(e.ip, e.mac);
   const macOfAsset = (a: Asset) => lower(a.mac) ?? arpMac.get(a.ip);
   const ipOfMac = new Map([...arpMac].map(([ip, mac]) => [mac, ip]));
+  // Addresses several routers share: the router that holds one has a second address in that network.
+  const sharedIps = new Set<string>();
+  const sharedBy = new Map<string, SharedAddressProtocol>(); // shared address → its protocol
+  const shares = (ip: string, mac?: string) => {
+    const protocol = sharedAddressProtocol(mac);
+    if (!protocol) return;
+    sharedIps.add(ip);
+    if (!sharedBy.has(ip)) sharedBy.set(ip, protocol);
+  };
+  for (const [ip, mac] of arpMac) shares(ip, mac);
+  for (const a of gateway ? [gateway, ...rest] : rest) shares(a.ip, macOfAsset(a));
   const byMac = new Map<string, Asset>();
   const byIpAddr = new Map<string, Asset>();
   for (const a of rest) {
@@ -777,6 +834,17 @@ function withGear(
       gearId.set(d.ip, gatewayNode);
       const node = b.nodes.find((n) => n.id === gatewayNode);
       if (node) Object.assign(node, { managed: true, label: node.label ?? d.sysName, detail: d.sysDescr });
+      // A gateway address routers share is not this device's own: the node is the inventory device
+      // on the address the device itself has in that network, and holds the shared one for lookups
+      // by address. When several devices list the shared address, the first one read stands.
+      const held = gatewayIp && sharedIps.has(gatewayIp) ? d.addresses?.find((x) => x.ip === gatewayIp) : undefined;
+      const mine = held ? d.addresses?.find((x) => !sharedIps.has(x.ip) && x.prefix === held.prefix && cidrOf(x.ip, x.prefix) === cidrOf(held.ip, held.prefix)) : undefined;
+      const self = mine ? byIpAddr.get(mine.ip) : undefined;
+      if (node && held) node.sharedGateway = true;
+      if (node && self && node.assetId === gateway?.id) {
+        Object.assign(node, { assetId: self.id, ip: gatewayIp });
+        placed.add(self.id);
+      }
       if (node && d.forwarding && !d.bridgePorts && !d.fdb.length) Object.assign(node, { deviceType: 'router', typeRead: true });
       else if (node && switchRead(d, gateway)) Object.assign(node, { deviceType: 'switch', typeRead: true });
       continue;
@@ -801,6 +869,37 @@ function withGear(
     }
   }
   const gearOf = new Map(devices.map((d) => [gearId.get(d.ip) as string, d]));
+  // A router that holds an address it shares with others says so on its card: which address, by
+  // which protocol, and whether the readings show it answering for it. With GLBP every router
+  // answers, so none is singled out; nor is any when the interface is down or when several
+  // routers list the address.
+  const holders = new Map<string, number>(); // shared address → how many devices list it
+  for (const d of devices) for (const x of d.addresses ?? []) if (sharedBy.has(x.ip)) holders.set(x.ip, (holders.get(x.ip) ?? 0) + 1);
+  for (const [id, d] of gearOf) {
+    const held = (d.addresses ?? []).flatMap((x): SharedGateway[] => {
+      const protocol = sharedBy.get(x.ip);
+      if (!protocol || x.prefix <= 0 || x.prefix >= 32) return [];
+      const on = iface(d, x.ifIndex);
+      const port = on?.name;
+      const vlan = vlanOfInterface(port);
+      const active = !x.assumed && protocol !== 'GLBP' && on?.up !== false && holders.get(x.ip) === 1;
+      return [{ ip: x.ip, protocol, network: cidrOf(x.ip, x.prefix), ...(vlan !== undefined ? { vlan } : {}), ...(port ? { port } : {}), active }];
+    });
+    const node = b.nodes.find((n) => n.id === id);
+    if (node && held.length) node.gateways = held.sort((p, q) => (p.vlan ?? 0) - (q.vlan ?? 0) || ipKey(p.ip) - ipKey(q.ip));
+  }
+  // The network and broadcast addresses of a network a managed device holds answer a scan (the
+  // device itself replies on them) but are no device: the inventory entries on them are not drawn.
+  // An entry with a MAC address of its own is a device whatever its address, and stays.
+  const edgeAddresses = new Set<number>();
+  for (const d of devices) {
+    for (const x of d.addresses ?? []) {
+      if (!Number.isInteger(x.prefix) || x.prefix <= 0 || x.prefix > 30 || x.ip === '0.0.0.0' || x.ip.startsWith('127.') || ipKey(x.ip) === Number.MAX_SAFE_INTEGER) continue;
+      const first = ipKey(cidrOf(x.ip, x.prefix).split('/')[0] as string);
+      edgeAddresses.add(first).add(first + 2 ** (32 - x.prefix) - 1);
+    }
+  }
+  for (const a of rest) if (!gearId.has(a.ip) && !macOfAsset(a) && edgeAddresses.has(ipKey(a.ip))) placed.add(a.id);
 
   // Where each routing device sends traffic for other networks. A device whose next hop is not a
   // managed device is a way out of the managed network, and heads a tree of its own.
@@ -865,10 +964,12 @@ function withGear(
   const headIp = (node: string) => ipKey(gearOf.get(node)?.ip ?? rest.find((a) => a.id === node)?.ip ?? '');
   const heads = [first, ...[...exits.keys()].filter((h) => h !== first).sort((x, y) => headIp(x) - headIp(y))];
   const roots: string[] = [];
+  const exitNode = new Map<string, string>(); // node heading a tree → the node drawn for its way out
   b.unlink(INTERNET_ID);
   heads.forEach((head, i) => {
     const exit = exits.get(head) as Exit;
     const id = i === 0 ? INTERNET_ID : `internet:${head}`;
+    exitNode.set(head, id);
     b.node({ id, kind: 'internet' });
     const node = b.nodes.find((n) => n.id === id) as MapNode;
     if (exit.nextHop) node.ip = exit.nextHop;
@@ -885,13 +986,18 @@ function withGear(
   });
   /** The managed router that holds the network `ip` is in, other than `self`: the most specific one. */
   const routerOf = (ip: string, self?: string): string | undefined => {
-    let best: { node: string; prefix: number } | undefined;
+    let best: { node: string; prefix: number; shared: boolean; key: number } | undefined;
     for (const d of devices) {
       const node = gearId.get(d.ip) as string;
       if (node === self || (!d.forwarding && node !== gatewayNode)) continue;
       for (const x of d.addresses ?? []) {
-        if (x.prefix <= 0 || x.prefix >= 32 || x.ip === '0.0.0.0' || !inCidr(ip, `${x.ip}/${x.prefix}`)) continue;
-        if (!best || x.prefix > best.prefix) best = { node, prefix: x.prefix };
+        const net = `${x.ip}/${x.prefix}`;
+        if (x.prefix <= 0 || x.prefix >= 32 || x.ip === '0.0.0.0' || !inCidr(ip, net)) continue;
+        // Several routers on the same network: the one that holds its shared address, then the
+        // lowest address, whatever order the devices were read in.
+        const found = { node, prefix: x.prefix, shared: !!d.addresses?.some((y) => sharedIps.has(y.ip) && inCidr(y.ip, net)), key: ipKey(d.ip) };
+        const closer = !best || found.prefix > best.prefix || (found.prefix === best.prefix && (Number(found.shared) - Number(best.shared) || best.key - found.key) > 0);
+        if (closer) best = found;
       }
     }
     return best?.node;
@@ -905,7 +1011,9 @@ function withGear(
   interface Cable {
     a: string;
     b: string;
-    ends: Map<string, { port?: string; iface?: GearInterface; ip?: string; routes?: RoutedVlan[] }>;
+    ends: Map<string, { port?: string; iface?: GearInterface; ip?: string; routes?: RoutedVlan[]; members?: string[] }>;
+    /** How many cables a link bundle stands for, when this cable is one. */
+    bundled?: number;
   }
   const cables = new Map<string, Cable>();
   const between = new Map<string, Cable[]>(); // "a|b" (sorted) → the cables joining a and b
@@ -940,6 +1048,40 @@ function withGear(
   const behind = new Map<string, string>(); // "ip|ifIndex" → node id of the neighbour on that port
   const gearPorts = new Set<string>(); // "ip|ifIndex" of ports that lead to other gear
   const heardFrom = new Map<string, { source: string; rank: readonly [number, number] }>(); // neighbour node → the device and port it hangs from
+  // A neighbour heard on the port a device's default route leaves through stands above that
+  // device. When several devices hear the same neighbour that way, the one with the lowest address
+  // has it above, whatever order the devices were read in.
+  const through = new Map<string, { id: string; hang?: () => void }>(); // device → the neighbour its way out passes
+  const neighbourKey = (n: GearDevice['neighbors'][number]) => n.chassisMac ?? n.portMac ?? n.mgmtIp ?? n.sysName ?? n.chassisId;
+  const aboveOf = (self: string) => (exits.get(self)?.nextHop ? exitNode.get(self) : routeParent.get(self));
+  const passes = new Map<string, string>(); // neighbour → the address of the device that has it above
+  for (const d of devices) {
+    const self = gearId.get(d.ip) as string;
+    const way = wayOut.get(d.ip);
+    const above = aboveOf(self);
+    if (!way || way.via || !above || gearOf.has(above)) continue;
+    for (const n of d.neighbors) {
+      const key = neighbourKey(n);
+      if (!key || n.localIfIndex !== way.ifIndex) continue;
+      const holder = passes.get(key);
+      if (holder === undefined || ipKey(d.ip) < ipKey(holder)) passes.set(key, d.ip);
+    }
+  }
+  // A neighbour that gives no address the scan knows is still a managed device when it names a
+  // MAC address of one (its own or that of a port), or, giving nothing else at all, the name of
+  // one. An address or a name that two managed devices share tells neither, nor does an address
+  // routers share.
+  const gearByMac = new Map<string, string | undefined>();
+  const gearByName = new Map<string, string | undefined>();
+  for (const d of devices) {
+    const node = gearId.get(d.ip) as string;
+    for (const mac of new Set([d.mac, ...d.interfaces.map((i) => i.mac)])) {
+      if (!mac || /^(00[:-]?){5}00$/.test(mac) || sharedAddressProtocol(mac)) continue;
+      gearByMac.set(mac, gearByMac.has(mac) && gearByMac.get(mac) !== node ? undefined : node);
+    }
+    const name = d.sysName?.toLowerCase();
+    if (name) gearByName.set(name, gearByName.has(name) && gearByName.get(name) !== node ? undefined : node);
+  }
   for (const d of devices) {
     const self = gearId.get(d.ip) as string;
     for (const n of d.neighbors) {
@@ -953,9 +1095,12 @@ function withGear(
         (nMac ? byMac.get(nMac) : undefined) ??
         (n.mgmtIp ? byIpAddr.get(n.mgmtIp) : undefined) ??
         (n.sysName ? rest.find((x) => x.hostname?.toLowerCase() === n.sysName?.toLowerCase()) : undefined);
+      // By name only when the neighbour gives nothing else at all, and never the device that heard it.
+      const byName = !nMac && !n.mgmtIp && !n.chassisId && n.sysName ? gearByName.get(n.sysName.toLowerCase()) : undefined;
+      const named = byName !== self ? byName : undefined;
       const peer = isGateway(n.mgmtIp, nMac, n.sysName)
         ? gatewayNode
-        : ((a ? gearId.get(a.ip) : undefined) ?? (n.mgmtIp ? gearId.get(n.mgmtIp) : undefined));
+        : ((a ? gearId.get(a.ip) : undefined) ?? (n.mgmtIp ? gearId.get(n.mgmtIp) : undefined) ?? (nMac ? gearByMac.get(nMac) : undefined) ?? named);
       if (peer === self) continue;
       if (peer) {
         const c = cable(self, peer, port, remotePort);
@@ -973,7 +1118,11 @@ function withGear(
         continue;
       }
       const vendor = nMac ? devices.flatMap((x) => x.fdb).find((f) => f.mac === nMac)?.vendor : undefined;
-      const announcedType = neighbourType(n.sysName, n.sysDescr ?? n.platform, n.capabilities);
+      // A neighbour that says it routes, on a port where the switch also learned other devices:
+      // their frames cross it unrouted, so it switches. Addresses routers share are its own.
+      const carries = (!!a || !!nMac) && learnedHere.some((f) => f.mac !== nMac && f.mac !== n.chassisMac && f.mac !== n.portMac && !sharedAddressProtocol(f.mac) && !!byMac.get(f.mac) && byMac.get(f.mac) !== a);
+      const said = neighbourType(n.sysName, n.sysDescr ?? n.platform, n.capabilities);
+      const announcedType = said === 'router' && carries ? 'switch' : said;
       const via = n.protocols && !n.protocols.includes('lldp') ? 'CDP' : 'LLDP';
       b.node({
         id,
@@ -987,6 +1136,37 @@ function withGear(
         // What a device says it is over LLDP or CDP beats a guess from its open ports.
         deviceType: announcedType !== 'unknown' ? announcedType : a && a.type !== 'unknown' ? a.type : 'unknown',
       });
+      // A neighbour heard on the port the default route of this device leaves through, when that
+      // route leads to equipment that was not read, is on the way there: it stands above this
+      // device, under what the route leads to. How it is cabled further up is not known. A device
+      // that heads a tree is hung at once; any other when its route is what places it, and should
+      // a cable place it first, the neighbour hangs below it like any other.
+      const way = wayOut.get(d.ip);
+      const above = aboveOf(self);
+      const nKey = neighbourKey(n);
+      if (port && way && !way.via && way.ifIndex === port.ifIndex && above && !gearOf.has(above) && above !== id && !!nKey && passes.get(nKey) === d.ip && !through.has(self)) {
+        const earlier = heardFrom.get(id);
+        if (earlier) b.edges = b.edges.filter((e) => !(e.source === earlier.source && e.target === id));
+        heardFrom.set(id, { source: above, rank: [-1, -1] });
+        const hang = () => {
+          b.edges = b.edges.filter((e) => !(e.source === above && e.target === self));
+          b.link({ source: above, target: id, inferred: true });
+          b.link({
+            source: id,
+            target: self,
+            inferred: false,
+            sourcePort: remotePort,
+            targetPort: port.name,
+            speedMbps: port.speedMbps,
+            traffic: { ip: d.ip, ifIndex: port.ifIndex },
+          });
+        };
+        if (exits.get(self)?.nextHop) {
+          hang();
+          through.set(self, { id });
+        } else through.set(self, { id, hang });
+        continue;
+      }
       if (port) behind.set(`${d.ip}|${port.ifIndex}`, id);
       // A neighbour heard on several ports, of one device or of several, hangs from one of them:
       // the lowest address, then the lowest port, whatever order the devices were read in.
@@ -1009,7 +1189,99 @@ function withGear(
     }
   }
 
-  // A switch whose uplink is not already a cable to other gear reaches the gateway through it
+  /** The addresses a managed device holds itself: its own, those of its ports and the one the scan saw. */
+  const ownMacs = (d: GearDevice): Set<string> => {
+    const a = gateway?.ip === d.ip ? gateway : byIpAddr.get(d.ip);
+    return new Set([d.mac, ...d.interfaces.map((i) => i.mac), a ? macOfAsset(a) : undefined].map(lower).filter((m): m is string => !!m));
+  };
+
+  // A cable only one end of which heard the other: the end that heard nobody still belongs to a
+  // managed device. It is the port its neighbour named, when one port alone answers to that name
+  // and has no cable yet; else a port with no cable yet where that device learned an address of
+  // the neighbour. Once known, it leads to other gear like any port that heard a neighbour.
+  for (const c of cables.values()) {
+    for (const [node, other] of [[c.a, c.b], [c.b, c.a]] as const) {
+      const d = gearOf.get(node);
+      const end = c.ends.get(node);
+      if (!d || end?.iface) continue;
+      const answering = end?.port ? d.interfaces.filter((i) => portKey(i.name) === portKey(end.port)) : [];
+      const named = answering.length === 1 && !gearPorts.has(`${d.ip}|${answering[0]?.ifIndex}`) ? answering[0] : undefined;
+      const peer = gearOf.get(other);
+      const peerMacs = peer && peer !== d ? ownMacs(peer) : undefined;
+      const learned = !named && peerMacs ? d.fdb.find((f) => f.ifIndex !== undefined && peerMacs.has(f.mac) && !gearPorts.has(`${d.ip}|${f.ifIndex}`)) : undefined;
+      const port = named ?? iface(d, learned?.ifIndex);
+      if (!port) continue;
+      setEnd(c, node, { iface: port, ip: d.ip });
+      gearPorts.add(`${d.ip}|${port.ifIndex}`);
+    }
+  }
+
+  // Switches that announce no neighbours are joined by the addresses they learned. A device that
+  // knows its uplink, or is the gateway, has below it every device whose own address it learned
+  // on another port. When each of two devices has the other below, their tables disagree and
+  // neither counts.
+  const ownerOf = new Map<string, GearDevice[]>(); // own address → the devices that hold it
+  for (const d of devices) for (const mac of ownMacs(d)) ownerOf.set(mac, [...(ownerOf.get(mac) ?? []), d]);
+  const below = new Map<string, Map<string, number>>(); // device → each device below it, with the port it is on
+  for (const x of devices) {
+    const seen = new Map<string, number>();
+    const up = uplink.get(x.ip);
+    if (up !== undefined || gearId.get(x.ip) === gatewayNode) {
+      for (const f of x.fdb) {
+        if (f.ifIndex === undefined || f.ifIndex === up) continue;
+        for (const y of ownerOf.get(f.mac) ?? []) if (y !== x && !seen.has(y.ip)) seen.set(y.ip, f.ifIndex);
+      }
+    }
+    below.set(x.ip, seen);
+  }
+  const above = new Map<string, { d: GearDevice; port: number }[]>();
+  for (const y of devices) {
+    above.set(
+      y.ip,
+      devices.flatMap((x) => {
+        const port = below.get(x.ip)?.get(y.ip);
+        return port !== undefined && !below.get(y.ip)?.has(x.ip) ? [{ d: x, port }] : [];
+      }),
+    );
+  }
+  // A switch whose uplink is not a cable yet is plugged into the deepest device above it: the one
+  // at the end of the longest row of devices each above the next. Counting the devices above would
+  // not do: a switch cabled to two cores has as many above it as the switch plugged into it, which
+  // one of the cores never learns. Equal depths go to the lowest address, and depths are worked out
+  // lowest address first, so the order the devices were read in does not change the map. A port
+  // where a neighbour announced itself keeps that neighbour only.
+  const depths = new Map<string, number>();
+  const depth = (d: GearDevice, path = new Set<string>()): number => {
+    const known = depths.get(d.ip);
+    if (known !== undefined) return known;
+    // Tables that put a device above itself through others: the row stops there.
+    if (path.has(d.ip)) return 0;
+    path.add(d.ip);
+    const over = [...(above.get(d.ip) ?? [])].sort((p, q) => ipKey(p.d.ip) - ipKey(q.d.ip));
+    const found = Math.max(0, ...over.map((x) => depth(x.d, path) + 1));
+    path.delete(d.ip);
+    depths.set(d.ip, found);
+    return found;
+  };
+  for (const d of [...devices].sort((p, q) => ipKey(p.ip) - ipKey(q.ip))) depth(d);
+  const announced = new Set(gearPorts);
+  for (const y of devices) {
+    const up = uplink.get(y.ip);
+    if (up === undefined || announced.has(`${y.ip}|${up}`)) continue;
+    const self = gearId.get(y.ip) as string;
+    const free = (x: { d: GearDevice; port: number }) => !announced.has(`${x.d.ip}|${x.port}`) && !behind.has(`${x.d.ip}|${x.port}`);
+    const parent = (above.get(y.ip) ?? [])
+      .filter((x) => depth(x.d) < depth(y) && gearId.get(x.d.ip) !== self && free(x))
+      .sort((p, q) => depth(q.d) - depth(p.d) || ipKey(p.d.ip) - ipKey(q.d.ip))[0];
+    if (!parent) continue;
+    const node = gearId.get(parent.d.ip) as string;
+    const c = cable(node, self, iface(parent.d, parent.port));
+    setEnd(c, node, { iface: iface(parent.d, parent.port), ip: parent.d.ip });
+    setEnd(c, self, { iface: iface(y, up), ip: y.ip });
+    gearPorts.add(`${parent.d.ip}|${parent.port}`).add(`${y.ip}|${up}`);
+  }
+
+  // A switch whose uplink is still not a cable to other gear reaches the gateway through it
   // (learned from its MAC table, so the gateway's port is unknown unless the gateway answers SNMP).
   for (const d of devices) {
     const up = uplink.get(d.ip);
@@ -1057,6 +1329,9 @@ function withGear(
       const servedVlan = switches && svis > 1 && /^vl(an)?\s?\d+$/i.test(port?.name ?? '');
       if (x.ifIndex === egress && !servedVlan) continue;
       const net = cidrOf(x.ip, x.prefix);
+      // A shared address is a second address in a network the router names by its own address,
+      // also when it is the gateway address of the scanned network.
+      if (sharedIps.has(x.ip) && own.some((y) => y !== x && !sharedIps.has(y.ip) && cidrOf(y.ip, y.prefix) === net)) continue;
       // A cabled port, or a VLAN subinterface of one: its network lives behind that cable.
       const vlan = vlanOfInterface(port?.name);
       const physical = vlan !== undefined ? port?.name.replace(/\.\d+$/, '') : port?.name;
@@ -1110,6 +1385,50 @@ function withGear(
     if (mapNode && routed.length) mapNode.routes = routed.sort(byVlan);
   }
 
+  // The cables of a link bundle are one link: cables between the same two devices whose port at
+  // either end belongs to the same bundle, or is the bundle itself, become one cable on the bundle
+  // interface, which is where spanning tree and traffic are read. The ports are kept for its label.
+  const bundleOf = (node: string, i?: GearInterface): GearInterface | undefined => {
+    const d = gearOf.get(node);
+    if (!d || !i) return undefined;
+    if (i.memberOf !== undefined) return iface(d, i.memberOf);
+    return d.interfaces.some((x) => x.memberOf === i.ifIndex) ? i : undefined;
+  };
+  const merged = new Set<Cable>();
+  for (const [pair, list] of between) {
+    // Cables go together when they share the bundle at one end and name no other bundle at the other.
+    const groups: { at: [number | undefined, number | undefined]; cables: Cable[] }[] = [];
+    for (const c of list) {
+      const at = [c.a, c.b].map((n) => bundleOf(n, c.ends.get(n)?.iface)?.ifIndex) as [number | undefined, number | undefined];
+      if (at[0] === undefined && at[1] === undefined) continue;
+      const agrees = (g: (typeof groups)[number], k: 0 | 1) => at[k] === undefined || g.at[k] === undefined || g.at[k] === at[k];
+      const group = groups.find((g) => agrees(g, 0) && agrees(g, 1) && ((at[0] !== undefined && g.at[0] === at[0]) || (at[1] !== undefined && g.at[1] === at[1])));
+      if (group) {
+        group.cables.push(c);
+        group.at = [group.at[0] ?? at[0], group.at[1] ?? at[1]];
+      } else groups.push({ at, cables: [c] });
+    }
+    for (const { cables: group } of groups) {
+      const kept = group[0] as Cable;
+      const ends = [kept.a, kept.b].map((node) => {
+        const all = group.map((c) => c.ends.get(node)).filter((e) => !!e);
+        const whole = all.map((e) => bundleOf(node, e.iface)).find((x) => !!x);
+        const members = [...new Set(all.filter((e) => e.iface?.memberOf !== undefined || (!whole && e.port)).map((e) => shortPort(e.iface?.name ?? e.port ?? '')))].filter(Boolean).sort();
+        const first = all[0] ?? {};
+        return { ...first, port: whole?.name ?? first.port, iface: whole ?? first.iface, ip: all.find((e) => e.ip)?.ip, routes: all.find((e) => e.routes)?.routes, members: members.length ? members : undefined };
+      });
+      const cablesIn = Math.max(...ends.map((e) => e.members?.length ?? 0), 1);
+      // A lone cable on a lone member port stays the cable it is.
+      if (group.length < 2 && cablesIn < 2) continue;
+      kept.ends.set(kept.a, ends[0] as (typeof ends)[number]);
+      kept.ends.set(kept.b, ends[1] as (typeof ends)[number]);
+      kept.bundled = cablesIn;
+      for (const c of group.slice(1)) merged.add(c);
+      between.set(pair, (between.get(pair) ?? []).filter((c) => c === kept || !group.includes(c)));
+    }
+  }
+  if (merged.size) for (const [k, v] of cables) if (merged.has(v)) cables.delete(k);
+
   // Walk the cables from the gateway: each piece of gear hangs from the one closer to it, with the
   // parent's port at the top end and the child's (its uplink) at the bottom. Cables with a port
   // spanning tree blocks are walked last, so the tree drawn is the one traffic really takes.
@@ -1148,6 +1467,7 @@ function withGear(
           traffic: measured.iface && measured.ip ? { ip: measured.ip, ifIndex: measured.iface.ifIndex } : undefined,
           routes: top.routes ?? bottom.routes,
           routesAtTarget: (!top.routes && !!bottom.routes) || undefined,
+          bundle: c.bundled ? { cables: c.bundled, sourcePorts: top.members, targetPorts: bottom.members } : undefined,
         });
       }
     }
@@ -1164,6 +1484,16 @@ function withGear(
       .sort(([, x], [, y]) => ipKey(x.ip) - ipKey(y.ip));
     for (const [id, d] of ready.slice(0, 1)) {
       const parent = routeParent.get(id) as string;
+      // Its way out passes a neighbour that is drawn above it already, with the cable between them.
+      const passed = through.get(id);
+      if (passed?.hang) {
+        passed.hang();
+        passed.hang = undefined;
+        attached.add(id);
+        treeOf.set(id, treeOf.get(parent) as string);
+        walkFrom([id], false);
+        continue;
+      }
       const way = wayOut.get(d.ip);
       const egress = iface(d, way?.ifIndex);
       const parentGear = gearOf.get(parent);
@@ -1204,6 +1534,13 @@ function withGear(
     while (hangByRoute());
   }
   walkFrom([...attached], true);
+  // A device a cable placed before its route did: the neighbour on its way out hangs below it.
+  for (const [self, passed] of through) {
+    if (!passed.hang || b.edges.some((e) => e.target === passed.id)) continue;
+    const d = gearOf.get(self);
+    const port = d ? iface(d, wayOut.get(d.ip)?.ifIndex) : undefined;
+    b.link({ source: self, target: passed.id, inferred: false, sourcePort: port?.name, speedMbps: port?.speedMbps, traffic: d && port ? { ip: d.ip, ifIndex: port.ifIndex } : undefined });
+  }
   // Cables the walk did not need: both ends already hang from the tree by another path.
   const redundant: MapEdge[] = [];
   const peers: MapEdge[] = [];
@@ -1227,6 +1564,7 @@ function withGear(
         traffic: measuredEnd.iface && measuredEnd.ip ? { ip: measuredEnd.ip, ifIndex: measuredEnd.iface.ifIndex } : undefined,
         routes: ex.routes ?? ey.routes,
         routesAtTarget: (!ex.routes && !!ey.routes) || undefined,
+        bundle: c.bundled ? { cables: c.bundled, sourcePorts: ex.members, targetPorts: ey.members } : undefined,
       });
       continue;
     }
@@ -1246,6 +1584,7 @@ function withGear(
       traffic: measured.iface && measured.ip ? { ip: measured.ip, ifIndex: measured.iface.ifIndex } : undefined,
       stp: blockedEnd ? 'blocked' : undefined,
       blockedPort: blockedEnd ? { node: blockedEnd, port: shortPort(c.ends.get(blockedEnd)?.port ?? '') } : undefined,
+      bundle: c.bundled ? { cables: c.bundled, sourcePorts: from.members, targetPorts: to.members } : undefined,
     });
   }
 
@@ -1303,6 +1642,28 @@ function withGear(
     if (mac) gearMacs.add(mac);
   }
 
+  // Extenders that rewrite the addresses of the devices behind them, by the port that learned those
+  // addresses. A rewritten address that stands for an inventory device, and the extender's own
+  // when the inventory holds the extender, is that device: it is not drawn as an address apart.
+  const inventoryMacs = byLastBytes(rest.flatMap((a) => macOfAsset(a) ?? []));
+  const relayAt = new Map<string, Relay[]>();
+  const standsFor = new Set<string>();
+  for (const d of devices) {
+    const byPort = new Map<number, string[]>();
+    for (const f of d.fdb) if (f.ifIndex !== undefined && !transit.has(`${d.ip}|${f.ifIndex}`)) byPort.set(f.ifIndex, [...(byPort.get(f.ifIndex) ?? []), f.mac]);
+    for (const [ifIndex, macs] of byPort) {
+      const relays = relaysOnPort(macs, inventoryMacs);
+      if (!relays.length) continue;
+      relayAt.set(`${d.ip}|${ifIndex}`, relays);
+      for (const r of relays) {
+        for (const mac of r.alias.keys()) standsFor.add(mac);
+        if (r.self && r.realMac) standsFor.add(r.self);
+      }
+    }
+  }
+  /** The extender on a port that a learned address belongs to. */
+  const relayOf = (key: string, mac: string): Relay | undefined => relayAt.get(key)?.find((r) => r.members.includes(mac));
+
   // Ports holding one physical machine and its virtual machines: a virtualization host, not an
   // unmanaged switch. The host goes on the port and its virtual machines are grouped under it.
   const fdbVendor = new Map<string, string | undefined>();
@@ -1314,7 +1675,7 @@ function withGear(
     for (const f of d.fdb) if (f.ifIndex !== undefined && !gearMacs.has(f.mac)) byPort.set(f.ifIndex, (byPort.get(f.ifIndex) ?? new Set()).add(f.mac));
     for (const [ifIndex, macs] of byPort) {
       const key = `${d.ip}|${ifIndex}`;
-      if (macs.size < 2 || transit.has(key) || behind.has(key)) continue;
+      if (macs.size < 2 || transit.has(key) || behind.has(key) || relayAt.has(key)) continue;
       const physical = [...macs].filter((m) => !isVm(m));
       if (physical.length === 1 && physical.length < macs.size) hostOfPort.set(key, physical[0] as string);
     }
@@ -1350,27 +1711,94 @@ function withGear(
     return id;
   };
 
+  const relayNodes = new Map<string, string>();
+  /**
+   * The node of an extender on a port, made the first time it is needed. It hangs from the
+   * neighbour heard on that port (the access point it repeats), else from the port itself.
+   */
+  const relayNode = (d: GearDevice, port: GearInterface | undefined, key: string, relay: Relay): string => {
+    const known = relayNodes.get(`${key}|${relay.prefix}`);
+    if (known) return known;
+    const a = relay.realMac ? rest.find((x) => macOfAsset(x) === relay.realMac) : undefined;
+    const id = a?.id ?? `relay:${d.ip}:${port?.ifIndex ?? ''}:${relay.prefix}`;
+    relayNodes.set(`${key}|${relay.prefix}`, id);
+    // An extender already drawn another way keeps its place; the devices behind it join it there.
+    if (a && placed.has(a.id) && b.has(a.id)) return id;
+    if (a) placed.add(a.id);
+    const neighbour = behind.get(key);
+    b.node({
+      id,
+      kind: 'device',
+      assetId: a?.id,
+      label: a ? undefined : 'Wi-Fi extender',
+      detail: 'Wi-Fi extender · the devices behind it show under addresses it rewrites',
+      deviceType: 'ap',
+      typeRead: true,
+    });
+    b.link(
+      neighbour
+        ? { source: neighbour, target: id, inferred: false }
+        : { source: gearId.get(d.ip) as string, target: id, inferred: false, sourcePort: port?.name, speedMbps: port?.speedMbps, poe: port?.poe, poeWatts: port?.poeWatts, traffic: port ? { ip: d.ip, ifIndex: port.ifIndex } : undefined },
+    );
+    return id;
+  };
+
   const members = new Map<string, Member[]>();
   const add = (parent: string, member: Member) => {
     members.set(parent, [...(members.get(parent) ?? []), member]);
     placed.add(member.id);
   };
+  // Every port an address was learned on that does not lead to other gear, nearest first. The port
+  // with the fewest addresses is the one the device is plugged into: each switch further away
+  // learns it together with everything else behind that port. Equal counts go to the lowest
+  // switch address, so the order the devices were read in does not change the map.
+  const learnedOn = new Map<string, { d: GearDevice; f: GearFdbEntry }[]>();
+  for (const d of devices) {
+    const first = new Set<string>();
+    for (const f of d.fdb) {
+      // The first entry a device holds for an address stands for it.
+      if (first.has(f.mac)) continue;
+      first.add(f.mac);
+      if (f.ifIndex === undefined || transit.has(`${d.ip}|${f.ifIndex}`)) continue;
+      // A rewritten address is also where the device it stands for was learned.
+      const relay = relayOf(`${d.ip}|${f.ifIndex}`, f.mac);
+      const real = relay?.alias.get(f.mac) ?? (relay?.self === f.mac ? relay.realMac : undefined);
+      for (const mac of real ? [f.mac, real] : [f.mac]) {
+        const list = learnedOn.get(mac);
+        if (list) list.push({ d, f });
+        else learnedOn.set(mac, [{ d, f }]);
+      }
+    }
+  }
+  const shared = (x: { d: GearDevice; f: GearFdbEntry }) => macsOnPort.get(`${x.d.ip}|${x.f.ifIndex}`) ?? 0;
+  for (const list of learnedOn.values()) list.sort((p, q) => shared(p) - shared(q) || ipKey(p.d.ip) - ipKey(q.d.ip));
+  // An extender is where its rewritten address was learned, also when a port learned its real one.
+  for (const relays of relayAt.values()) {
+    for (const r of relays) {
+      const list = r.realMac ? learnedOn.get(r.realMac) : undefined;
+      const at = list?.findIndex((x) => x.f.mac === r.self) ?? -1;
+      if (list && at > 0) list.unshift(...list.splice(at, 1));
+    }
+  }
+
   /** Puts one learned address under the node that owns its port; false when it is not placed. */
   const place = (mac: string, make: (port?: GearInterface) => Member): boolean => {
-    for (const d of devices) {
-      const f: GearFdbEntry | undefined = d.fdb.find((e) => e.mac === mac);
-      if (!f || f.ifIndex === undefined) continue;
+    for (const { d, f } of learnedOn.get(mac) ?? []) {
       // The VLAN the address was learned in comes with it.
       const member = (port?: GearInterface): Member => {
         const m = make(port);
         return f.vlan ? { ...m, node: { ...m.node, vlan: f.vlan } } : m;
       };
       const key = `${d.ip}|${f.ifIndex}`;
-      if (transit.has(key)) continue;
       const port = iface(d, f.ifIndex);
       const neighbour = behind.get(key);
       const host = hostOfPort.get(key);
-      if (host) {
+      const relay = relayOf(key, f.mac);
+      if (relay) {
+        // The extender's own address is the extender; every other one is a device behind it.
+        const relayId = relayNode(d, port, key, relay);
+        if (f.mac !== relay.self) add(relayId, member());
+      } else if (host) {
         const hostId = hostNode(d, port, key, host);
         // The host itself is the node on the port; each virtual machine joins it, typed as one.
         if (mac !== host) {
@@ -1411,7 +1839,7 @@ function withGear(
   const portInfo = (p?: GearInterface): Partial<MapNode> => (p ? { port: p.name, poe: p.poe, poeWatts: p.poeWatts } : {});
 
   // Inventory devices first, then addresses switches learned that the inventory does not have.
-  const known = new Set<string>(gearMacs);
+  const known = new Set<string>([...gearMacs, ...standsFor]);
   for (const a of rest) {
     const mac = macOfAsset(a);
     if (mac) known.add(mac);
@@ -1439,12 +1867,32 @@ function withGear(
     if (g) g.title = 'Virtual machines';
   }
 
+  /**
+   * The node an address is beside its router at, when it is on the network that router's default
+   * route leaves through: what the route leads to, when that is equipment that was not read and
+   * the map shows it. That is the node drawn for the way out of a router that heads a tree, else
+   * the node the route of the router leads to. Undefined for any other address.
+   */
+  const besideOf = (ip: string): string | undefined => {
+    const router = routerOf(ip);
+    const d = router ? gearOf.get(router) : undefined;
+    const nextHop = d ? wayOut.get(d.ip)?.nextHop : undefined;
+    const out = d?.addresses?.find((x) => x.prefix > 0 && x.prefix < 32 && inCidr(ip, `${x.ip}/${x.prefix}`) && inCidr(nextHop ?? '', `${x.ip}/${x.prefix}`));
+    if (!router || !d || !nextHop || !out) return undefined;
+    // A VLAN that a switch routes between is a network it serves, also when its route leaves through it.
+    const isSvi = (ifIndex: number) => /^vl(an)?\s?\d+$/i.test(iface(d, ifIndex)?.name ?? '');
+    if ((!!d.bridgePorts || d.fdb.length > 0) && isSvi(out.ifIndex) && (d.addresses ?? []).filter((x) => isSvi(x.ifIndex)).length > 1) return undefined;
+    const beyond = exits.get(router)?.kind === 'upstream' ? exitNode.get(router) : routeParent.get(router);
+    return beyond && !gearOf.has(beyond) && b.has(beyond) ? beyond : undefined;
+  };
   // Devices no switch has seen (on the gateway's own ports or Wi-Fi, or without a MAC address).
   // Each stays with the managed router of its network, when one holds it; else with the gateway.
+  // On the network a router leaves through, they are beside that router, under what its route
+  // leads to.
   const unseen = new Map<string, Member[]>();
   for (const a of rest) {
     if (placed.has(a.id)) continue;
-    const holder = routerOf(a.ip) ?? gatewayNode;
+    const holder = besideOf(a.ip) ?? routerOf(a.ip) ?? gatewayNode;
     unseen.set(holder, [...(unseen.get(holder) ?? []), assetMember(a)]);
   }
   for (const [holder, list] of unseen) b.groups(holder, list, true, holder === gatewayNode ? false : `${holder}:unseen`);
@@ -1482,7 +1930,7 @@ function withGear(
     peers: peers.length ? peers : undefined,
     vlans: vlans.size ? [...vlans].sort((x, y) => x[0] - y[0]).map(([id, name]) => ({ id, name })) : undefined,
   };
-  return { topology, holderOf };
+  return { topology, holderOf, besideOf };
 }
 
 // ---------------------------------------------------------------- layout
@@ -1501,6 +1949,9 @@ export const NODE_SIZE: Record<MapNodeKind, Size> = {
 
 /** Extra height of a router card that lists the VLANs it routes. */
 export const ROUTES_ROW = 22;
+
+/** Extra height of a router card that names the shared gateway addresses it holds. */
+export const GATEWAY_ROW = 18;
 
 /** A device drawn inside a group container. */
 export const MEMBER_SIZE: Size = { w: 232, h: 42 };
@@ -1549,8 +2000,9 @@ export function layoutTree(topo: Topology, rootId = INTERNET_ID): Layout {
   // Group containers: header plus a grid of member cards.
   for (const n of topo.nodes) {
     if (n.kind !== 'group') {
-      const base = n.parent ? MEMBER_SIZE : NODE_SIZE[n.kind];
-      sizes[n.id] = n.routes?.some((r) => r.vlan !== undefined) && !n.parent ? { w: base.w, h: base.h + ROUTES_ROW } : base;
+      const base = n.parent ? MEMBER_SIZE : NODE_SIZE[n.sharedGateway ? 'device' : n.kind];
+      const rows = n.parent ? 0 : (n.routes?.some((r) => r.vlan !== undefined) ? ROUTES_ROW : 0) + (n.gateways?.length ? GATEWAY_ROW : 0);
+      sizes[n.id] = rows ? { w: base.w, h: base.h + rows } : base;
       continue;
     }
     const list = members.get(n.id) ?? [];
@@ -1640,6 +2092,61 @@ export function layoutTree(topo: Topology, rootId = INTERNET_ID): Layout {
     place(root, left, 0);
     left += width + TREE_GAP;
   }
+
+  // Devices cabled to two neighbours of the row above (one cable carries their traffic, spanning
+  // tree holds the other back) stand under the two, spread from one to the other, with whatever
+  // hangs from them: a single one in between, two under one each. Devices the first neighbour holds
+  // alone keep their place, and then the nearest of the others keeps its place too; this needs the
+  // devices cabled to both to be the ones on the side of the second neighbour. It holds only when
+  // the second neighbour has nothing below it of its own, so the room under it is free, and when
+  // the devices fit side by side without reaching past it.
+  const joined = new Set((topo.redundant ?? []).flatMap((e) => [`${e.source}|${e.target}`, `${e.target}|${e.source}`]));
+  const centre = (id: string) => (positions[id]?.x ?? 0) + size(id).w / 2;
+  // A device inside a group is placed within its group and never moved here; a move reaches each
+  // node below once, so links that loop cannot carry it round again.
+  const shift = (id: string, dx: number, dy: number, seen = new Set<string>()) => {
+    const at = positions[id];
+    if (seen.has(id) || !at || byId.get(id)?.parent) return;
+    seen.add(id);
+    positions[id] = { x: at.x + dx, y: at.y + dy };
+    for (const k of kids.get(id) ?? []) shift(k, dx, dy, seen);
+  };
+  // Rows from the top down, so what a row above moves is in place before the rows below it are looked at.
+  const above = (id: string) => positions[id] ?? { x: 0, y: 0 };
+  const rows = [...kids].sort(([p], [q]) => above(p).y - above(q).y || above(p).x - above(q).x || p.localeCompare(q)).map(([, row]) => row);
+  for (const row of rows) {
+    for (const [i, first] of row.entries()) {
+      const below = [...(kids.get(first) ?? [])].sort((p, q) => centre(p) - centre(q));
+      if (!below.length || byId.get(first)?.kind === 'group' || wraps(first)) continue;
+      const free = (q: string | undefined): q is string => q !== undefined && byId.get(q)?.kind !== 'group' && !(kids.get(q)?.length) && positions[q]?.y === positions[first]?.y;
+      const second = [row[i - 1], row[i + 1]].filter(free).find((q) => below.some((k) => joined.has(`${q}|${k}`)));
+      if (!second) continue;
+      const order = below.filter((k) => joined.has(`${second}|${k}`));
+      const alone = below.length - order.length;
+      // The ones cabled to both are the ones nearest the second neighbour, so none passes over another.
+      const right = centre(second) > centre(first);
+      if (alone && (order.length < 2 || !below.slice(right ? alone : 0, right ? undefined : order.length).every((k) => order.includes(k)))) continue;
+      const near = (right ? order[0] : order[order.length - 1]) as string;
+      const start = alone ? centre(near) : centre(first);
+      const from = Math.min(start, centre(second));
+      const to = Math.max(start, centre(second));
+      const width = (id: string) => widths.get(id) ?? size(id).w;
+      // The cables of the second neighbour turn in lanes of their own: the row moves down to make room for them.
+      const room = order.length * LANE_GAP;
+      const rest = below.filter((k) => !order.includes(k));
+      if (order.length === 1) {
+        shift(order[0] as string, (from + to) / 2 - centre(order[0] as string), room);
+        continue;
+      }
+      const step = (to - from) / (order.length - 1);
+      const fits = order.every((k, n) => n === 0 || step >= width(order[n - 1] as string) / 2 + width(k) / 2 + GAP_X);
+      // The outermost must not reach past the card above it by more than half the room between siblings.
+      const outer = (right ? order[order.length - 1] : order[0]) as string;
+      if (!fits || width(outer) / 2 > size(second).w / 2 + GAP_X / 2) continue;
+      order.forEach((k, n) => shift(k, from + n * step - centre(k), room));
+      for (const k of rest) shift(k, 0, room);
+    }
+  }
   return { positions, sizes };
 }
 
@@ -1658,6 +2165,7 @@ function childGap(parent: Box, children: { x: number; w: number; h: number }[]):
   const at = attachLinks(
     boxes,
     children.map((_, i) => ({ id: `c${i}`, source: 'p', target: `c${i}` })),
+    true,
   );
   const deepest = Math.max(-1, ...[...at.values()].map((a) => (a.sourceSide === 'bottom' ? (a.lane ?? 0) : -1)));
   return deepest < 0 ? GAP_Y : Math.max(GAP_Y, LANE_START + deepest * LANE_GAP + LANE_CLEAR);
@@ -1733,8 +2241,11 @@ function pointOn(b: Box, side: Side, fraction: number): { x: number; y: number }
  * beyond that edge of the node) leave through the left and right sides instead, so the bottom keeps
  * fewer, wider-spaced links. These run out sideways and drop straight into their device; the one
  * going furthest leaves highest, so they nest without crossing.
+ *
+ * Cables of different nodes are then moved clear of each other (`separateCables`), unless
+ * `lanesOnly` asks for the lanes alone.
  */
-export function attachLinks(boxes: ReadonlyMap<string, Box>, links: { id: string; source: string; target: string }[]): Map<string, Attachment> {
+export function attachLinks(boxes: ReadonlyMap<string, Box>, links: { id: string; source: string; target: string }[], lanesOnly = false): Map<string, Attachment> {
   type End = { link: string; node: string; other: string; side: Side; role: 's' | 't'; spread?: boolean };
   const ends: End[] = [];
   for (const l of links) {
@@ -1827,7 +2338,91 @@ export function attachLinks(boxes: ReadonlyMap<string, Box>, links: { id: string
       });
     }
   }
+  if (!lanesOnly) separateCables(boxes, links, out);
   return out;
+}
+
+/** Closest two level runs of different cables may be, and two drops side by side. */
+const RUN_CLEAR = LANE_GAP - 4;
+const DROP_CLEAR = 8;
+/** How far an end moves along its side to get out from under another cable. */
+const DROP_STEP = 20;
+
+/**
+ * Moves cables that would run over the cables of another device. Lanes keep the links of one side
+ * of one device apart; two devices in a row know nothing of each other, so a cable from the second
+ * can turn at the height where one from the first already runs, or drop down the line another
+ * climbs. Cables are taken in the order given, each kept clear of those before it: its level run
+ * moves a lane further from its source until it is free, and an end that shares its drop with
+ * another cable moves along its side towards the cable's other end. A straight cable is never
+ * bent, and a cable with nowhere to go stays where it was. Only cables between a top and a bottom
+ * side are looked at; the rest keep the single bend they have.
+ */
+function separateCables(boxes: ReadonlyMap<string, Box>, links: { id: string; source: string; target: string }[], out: Map<string, Attachment>): void {
+  type Run = { x1: number; x2: number; y: number };
+  type Drop = { end: 's' | 't'; x: number; y1: number; y2: number };
+  const upright = (side: Side) => side === 'top' || side === 'bottom';
+  const turnOf = (a: Attachment) => a.turn ?? (a.sy + a.ty) / 2;
+  const bent = (a: Attachment) => Math.abs(a.sx - a.tx) > 1;
+  const runOf = (a: Attachment): Run | undefined => (bent(a) ? { x1: Math.min(a.sx, a.tx), x2: Math.max(a.sx, a.tx), y: turnOf(a) } : undefined);
+  const dropsOf = (a: Attachment): Drop[] => [
+    { end: 's', x: a.sx, y1: Math.min(a.sy, turnOf(a)), y2: Math.max(a.sy, turnOf(a)) },
+    { end: 't', x: a.tx, y1: Math.min(a.ty, turnOf(a)), y2: Math.max(a.ty, turnOf(a)) },
+  ];
+  // Cables already in place do not move again: their stretches are worked out once.
+  const runs: Run[] = [];
+  const drops: Drop[] = [];
+  const runUnder = (p: Run): Run | undefined => {
+    for (const q of runs) if (Math.abs(p.y - q.y) < RUN_CLEAR && Math.min(p.x2, q.x2) - Math.max(p.x1, q.x1) > 4) return q;
+    return undefined;
+  };
+  /** The end of the cable whose drop shares a line with a drop already in place, if any. */
+  const sharedDrop = (a: Attachment): 's' | 't' | undefined => {
+    for (const p of dropsOf(a)) for (const q of drops) if (Math.abs(p.x - q.x) < DROP_CLEAR && Math.min(p.y2, q.y2) - Math.max(p.y1, q.y1) > 4) return p.end;
+    return undefined;
+  };
+
+  for (const l of links) {
+    const a = out.get(l.id);
+    const source = boxes.get(l.source);
+    const target = boxes.get(l.target);
+    if (!a || !source || !target || !upright(a.sourceSide) || !upright(a.targetSide) || a.sourceSide === a.targetSide) continue;
+    if (bent(a) && drops.length) {
+      // The level run: a lane further from the source each time, never past the far end.
+      const dir = a.ty > a.sy ? 1 : -1;
+      const first = a.turn;
+      let free = false;
+      for (let tries = 0; tries < 12 && !free; tries++) {
+        const over = runUnder(runOf(a) as Run);
+        if (!over) {
+          free = true;
+          break;
+        }
+        const wanted = over.y + dir * LANE_GAP;
+        if (dir > 0 ? wanted > a.ty - 10 : wanted < a.ty + 10) break;
+        a.turn = wanted;
+      }
+      if (!free) a.turn = first;
+      // The drops: the end on a line another cable uses steps along its side towards its own far
+      // end, as long as the cable stays longer than the step and the end stays on its card.
+      const before = { sx: a.sx, tx: a.tx };
+      for (let tries = 0; tries < 6; tries++) {
+        const end = sharedDrop(a);
+        if (!end) break;
+        const box = end === 's' ? source : target;
+        const moved = (end === 's' ? a.sx : a.tx) + (end === 's' ? Math.sign(a.tx - a.sx) : Math.sign(a.sx - a.tx)) * DROP_STEP;
+        if (Math.abs(a.sx - a.tx) < DROP_STEP * 2 || moved < box.x + 8 || moved > box.x + box.w - 8) {
+          Object.assign(a, before);
+          break;
+        }
+        if (end === 's') a.sx = moved;
+        else a.tx = moved;
+      }
+    }
+    const run = runOf(a);
+    if (run) runs.push(run);
+    drops.push(...dropsOf(a));
+  }
 }
 
 // ---------------------------------------------------------------- cable labels
@@ -1966,12 +2561,6 @@ export function placeCableLabels(
     place();
   }
 
-  // Still crowded: the middle label steps beside the line.
-  if (midPoint && sizes.mid && (overlaps(out.src, sizes.src, midPoint, sizes.mid) || overlaps(out.dst, sizes.dst, midPoint, sizes.mid))) {
-    const side = Math.max(sizes.src?.w ?? 0, sizes.dst?.w ?? 0, 0);
-    if (dirAt(total / 2) === 'h') midPoint.y += Math.max(sizes.src?.h ?? 0, sizes.dst?.h ?? 0) / 2 + sizes.mid.h / 2 + LABEL_GAP / 2;
-    else midPoint.x += side / 2 + sizes.mid.w / 2 + LABEL_GAP;
-  }
   // Very short cables: the two port names sit on either side of the line.
   if (out.src && out.dst && sizes.src && sizes.dst && overlaps(out.src, sizes.src, out.dst, sizes.dst)) {
     if (dirAt(srcD) === 'h') {
@@ -1985,14 +2574,14 @@ export function placeCableLabels(
   out.mid = midPoint;
 
   // Other cables' labels: each label here slides along its own cable until it is clear of them.
+  const clearOf = (p: Point | undefined, size: LabelSize | undefined) => {
+    if (!p || !size) return true;
+    const a = box(p, size);
+    return !avoid.some((q) => a.x < q.x + q.w + LABEL_GAP && q.x < a.x + a.w + LABEL_GAP && a.y < q.y + q.h + LABEL_GAP && q.y < a.y + a.h + LABEL_GAP);
+  };
+  const portsClear = () => !overlaps(out.src, sizes.src, out.dst, sizes.dst);
+  const ownClear = () => portsClear() && !overlaps(out.src, sizes.src, out.mid, sizes.mid) && !overlaps(out.dst, sizes.dst, out.mid, sizes.mid);
   if (avoid.length) {
-    const clearOf = (p: Point | undefined, size: LabelSize | undefined) => {
-      if (!p || !size) return true;
-      const a = box(p, size);
-      return !avoid.some((q) => a.x < q.x + q.w + LABEL_GAP && q.x < a.x + a.w + LABEL_GAP && a.y < q.y + q.h + LABEL_GAP && q.y < a.y + a.h + LABEL_GAP);
-    };
-    const portsClear = () => !overlaps(out.src, sizes.src, out.dst, sizes.dst);
-    const ownClear = () => portsClear() && !overlaps(out.src, sizes.src, out.mid, sizes.mid) && !overlaps(out.dst, sizes.dst, out.mid, sizes.mid);
     // Port names move away from their device, never past the middle of the cable.
     const slide = (end: 'src' | 'dst') => {
       const size = sizes[end];
@@ -2024,46 +2613,56 @@ export function placeCableLabels(
     };
     slide('src');
     slide('dst');
-    // The middle label tries spots along the cable, nearest the middle first, then beside it.
-    const midSize = sizes.mid;
-    if (midSize && out.mid && (!clearOf(out.mid, midSize) || !ownClear())) {
-      const start = out.mid;
-      const fits = (q: Point) => {
-        out.mid = q;
-        return clearOf(q, midSize) && ownClear();
-      };
-      let found = false;
-      const search = () => {
-        for (let k = 0; k <= 50 && !found; k++) {
-          for (const sign of k ? [1, -1] : [1]) {
-            const d = total / 2 + sign * k * 6;
-            if (d < total * 0.12 || d > total * 0.88) continue;
-            const pt = at(snap(d));
-            const dir = dirAt(snap(d));
-            const spots =
-              dir === 'h'
-                ? [{ x: pt.x, y: pt.y }, { x: pt.x, y: pt.y - midSize.h - 2 }, { x: pt.x, y: pt.y + midSize.h + 2 }]
-                : [{ x: pt.x, y: pt.y }, { x: pt.x - midSize.w / 2 - 6, y: pt.y }, { x: pt.x + midSize.w / 2 + 6, y: pt.y }];
-            if (spots.some(fits)) {
-              found = true;
-              break;
-            }
-          }
-        }
-      };
-      search();
-      // Still no room: the port names step to their closest spots on the cable, then try again.
-      if (!found) {
-        const keep = { src: out.src, dst: out.dst };
-        if (sizes.dst && out.dst) out.dst = pos(dstMin, true, sizes.dst);
-        if (!clearOf(out.dst, sizes.dst)) out.dst = keep.dst;
-        search();
-        if (!found) {
-          out.dst = keep.dst;
-          out.src = keep.src;
+  }
+  // The middle label stays on its cable: where the middle is taken, by the port names of this
+  // cable or by the labels of others, it takes the free spot along the cable nearest the middle.
+  // Only when the cable has none does it stand beside the line.
+  const midSize = sizes.mid;
+  if (midSize && out.mid && (!clearOf(out.mid, midSize) || !ownClear())) {
+    const start = out.mid;
+    const fits = (q: Point) => {
+      out.mid = q;
+      return clearOf(q, midSize) && ownClear();
+    };
+    /** The spots at a distance along the cable: on the line, or the two beside it. */
+    const spots = (d: number, beside: boolean): Point[] => {
+      const pt = at(snap(d));
+      if (!beside) return [{ x: pt.x, y: pt.y }];
+      return dirAt(snap(d)) === 'h'
+        ? [{ x: pt.x, y: pt.y - midSize.h - 2 }, { x: pt.x, y: pt.y + midSize.h + 2 }]
+        : [{ x: pt.x - midSize.w / 2 - 6, y: pt.y }, { x: pt.x + midSize.w / 2 + 6, y: pt.y }];
+    };
+    const search = (beside: boolean): boolean => {
+      for (let k = 0; k <= 50 && k * 6 <= total / 2; k++) {
+        for (const sign of k ? [1, -1] : [1]) {
+          const d = total / 2 + sign * k * 6;
+          if (k && (d < total * 0.12 || d > total * 0.88)) continue;
+          if (spots(d, beside).some(fits)) return true;
         }
       }
-      if (!found) out.mid = start;
+      return false;
+    };
+    let found = search(false);
+    // No room on the cable: the port names step to their closest spots on it, then it tries again.
+    if (!found) {
+      const keep = { src: out.src, dst: out.dst };
+      if (sizes.dst && out.dst) out.dst = pos(dstMin, true, sizes.dst);
+      if (!clearOf(out.dst, sizes.dst)) out.dst = keep.dst;
+      found = out.dst !== keep.dst && search(false);
+      if (!found) {
+        out.dst = keep.dst;
+        out.src = keep.src;
+        found = search(true);
+      }
+    }
+    // Nothing is free anywhere: beside the middle of the line, clear of this cable's own port names at least.
+    if (!found) {
+      out.mid = start;
+      if (!ownClear()) {
+        const tall = Math.max(sizes.src?.h ?? 0, sizes.dst?.h ?? 0);
+        const wide = Math.max(sizes.src?.w ?? 0, sizes.dst?.w ?? 0);
+        out.mid = dirAt(total / 2) === 'h' ? { x: start.x, y: start.y + tall / 2 + midSize.h / 2 + LABEL_GAP / 2 } : { x: start.x + wide / 2 + midSize.w / 2 + LABEL_GAP, y: start.y };
+      }
     }
   }
   // A cable that is not drawn yet can measure as NaN; such positions are left out.

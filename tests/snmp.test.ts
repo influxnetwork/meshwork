@@ -107,6 +107,19 @@ describe('SNMP decoding', () => {
     ]);
   });
 
+  it('reads which ports are bundled into one link, and leaves subinterfaces alone', () => {
+    const w = walks();
+    const [one, two, three, bundle] = [101, 102, 103, 50];
+    const stack = (higher: number, lower: number) => vb(`${OID.ifStackStatus}.${higher}.${lower}`, 1);
+    w.ifName.push(vb(`${OID.ifName}.${bundle}`, 'Po1'), vb(`${OID.ifName}.60`, 'Gi0/3.10'), vb(`${OID.ifName}.61`, 'Gi0/3.20'), vb(`${OID.ifName}.70`, 'Po2'));
+    // Po1 over ports 1 and 2; two subinterfaces over port 3; Po2 over port 3 alone; every one over or under nothing.
+    w.ifStack = [stack(0, bundle), stack(bundle, one), stack(bundle, two), stack(one, 0), stack(two, 0), stack(60, three), stack(61, three), stack(70, three), stack(three, 0)];
+    const d = parseGear('192.0.2.2', w);
+    const memberOf = (ifIndex: number) => d.interfaces.find((i) => i.ifIndex === ifIndex)?.memberOf;
+    expect([memberOf(one), memberOf(two), memberOf(three), memberOf(bundle)]).toEqual([bundle, bundle, undefined, undefined]);
+    expect(parseGear('192.0.2.2', walks()).interfaces.every((i) => i.memberOf === undefined)).toBe(true);
+  });
+
   it('uses the port description when a neighbour names its port by MAC address', () => {
     const w = walks();
     w.lldpRem = w.lldpRem.map((v) =>
@@ -149,6 +162,19 @@ describe('SNMP decoding', () => {
     w.lldpRemManAddr = [vb(`${OID.lldpRemManAddr}.102.1.1.4.10.9.0.2`, 2)];
     const n = parseGear('10.9.0.250', w).neighbors[0];
     expect(n).toMatchObject({ localPort: 'gi2', sysName: 'lobby-ap', mgmtIp: '10.9.0.2', remotePort: 'eth0' });
+  });
+
+  it('reads a neighbour whose table names no local port and gives its address as text', () => {
+    const w = walks();
+    // Local port number 0, and the chassis address written out instead of given as six bytes.
+    w.lldpRem = w.lldpRem.map((v) => {
+      const oid = v.oid.replace(/\.0\.102\.1$/, '.0.0.1');
+      return vb(oid, oid.startsWith(`${OID.lldpRem}.5.`) ? Buffer.from('AA:00:00:00:00:02') : v.value);
+    });
+    w.lldpRemManAddr = [];
+    const n = parseGear('10.9.0.250', w).neighbors[0];
+    // The port is the one where the switch learned that address.
+    expect(n).toMatchObject({ chassisMac: 'aa:00:00:00:00:02', localIfIndex: 102, localPort: 'gi2', sysName: 'lobby-ap' });
   });
 
   it('decodes values the way SNMP libraries return them', () => {
@@ -603,8 +629,8 @@ describe('gateway from managed devices that route', () => {
 
   it("ignores a router's upstream outside the scanned network: the router itself is the gateway", () => {
     // A firewall routes to its internet provider; the layer 2 switch has no default route.
-    const field = [dev('172.17.154.225', undefined, false), dev('172.17.154.1', '203.0.113.129', true)];
-    expect(gatewayFromGear(field, '172.17.154.0/23')).toBe('172.17.154.1');
+    const field = [dev('172.31.154.225', undefined, false), dev('172.31.154.1', '203.0.113.129', true)];
+    expect(gatewayFromGear(field, '172.31.154.0/23')).toBe('172.31.154.1');
     // Several networks listed for one map; a layer 3 switch pointing at an unmanaged firewall inside them still counts.
     expect(gatewayFromGear([dev('172.20.99.2', '172.20.99.1', true), dev('172.20.10.1', '10.0.0.1', true)], '172.20.10.0/24, 172.20.99.0/24')).toBe('172.20.99.1');
   });

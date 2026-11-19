@@ -5,7 +5,10 @@
  */
 import { followDefaultRoutes } from './default-routes';
 import { inCidr } from './report';
-import type { GearDevice } from './types';
+import type { GearDevice, Network } from './types';
+
+/** Every range scanned for a network, comma-separated: the ranges that name it and those scanned into it. */
+export const scannedRanges = (network: Pick<Network, 'cidr' | 'alsoScanned'>): string => [network.cidr, network.alsoScanned].filter(Boolean).join(', ');
 
 export interface UnscannedNetwork {
   /** The network, as CIDR text ready to scan. */

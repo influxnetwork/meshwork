@@ -186,6 +186,27 @@ export function macGaps(hosts: Iterable<DiscoveredHost>, cidr: string, own: Map<
   return [...hosts].filter((h) => !h.mac && !own.has(h.ip) && inSubnet(h.ip, cidr));
 }
 
+/**
+ * Addresses worth one more look: those that did not answer, share their /24 block with one that
+ * did, and are outside the subnets whose neighbour table was read (`covered`). There the table
+ * tells who is present whatever the probes missed; elsewhere nothing does, so a device that
+ * missed its answer for a moment is only found by asking again. A block where nothing answered is
+ * left alone.
+ */
+export function silentAddresses(addresses: string[], live: ReadonlySet<string>, covered: string[]): string[] {
+  const block = (ip: string) => ip.slice(0, ip.lastIndexOf('.'));
+  const active = new Set([...live].map(block));
+  return addresses.filter((ip) => !live.has(ip) && active.has(block(ip)) && !covered.some((cidr) => inSubnet(ip, cidr)));
+}
+
+/** The subnets the neighbour table tells about: those it holds at least one address of. */
+export function subnetsInTable(cidrs: string[], table: ReadonlyMap<string, string>): string[] {
+  return cidrs.filter((cidr) => [...table.keys()].some((ip) => inSubnet(ip, cidr)));
+}
+
+/** Most addresses pinged at a time in the second look, whatever the timing profile. */
+const SECOND_LOOK_MAX = 96;
+
 /** Port lists longer than this wait per host only as long as the host takes to answer. */
 export const ADAPTIVE_MIN_PORTS = 1024;
 /** How often hosts that gained open ports are sent during the port scan. */
@@ -416,6 +437,29 @@ export async function runScan(opts: EngineOptions): Promise<void> {
       hosts.set(ip, host);
     }
     host.mac ??= mac;
+  }
+  // One more ping, with a longer wait, for the silent addresses the table says nothing about. The
+  // table speaks for the subnets this computer is on that it holds an address of. This computer
+  // answering does not make its block one where something answered. A ping alone is light, so
+  // twice as many addresses are asked at a time as in the first look, up to a fixed number.
+  const covered = subnetsInTable(interfaces.filter((i) => rangeContains(ranges, i.address)).map((i) => i.cidr), arp);
+  const answered = new Set([...hosts.keys()].filter((ip) => !own.has(ip)));
+  const silent = lanBlocked ? [] : silentAddresses(addresses, answered, covered).filter((ip) => !hosts.has(ip));
+  if (silent.length && !signal.aborted) {
+    phaseTotal += silent.length;
+    progress(true);
+    await forEachLimited(silent, Math.min(timing.hosts * 2, SECOND_LOOK_MAX), signal, async (ip) => {
+      const reply = await sockets.run(() => ping(ip, TIMING.cautious.pingMs));
+      if (reply.alive) {
+        const host = newHost(ip);
+        host.aliveVia.push('icmp');
+        host.rttMs = reply.rttMs;
+        host.ttl = reply.ttl;
+        hosts.set(ip, host);
+      }
+      done++;
+      progress();
+    });
   }
   // Second, slower pass for live hosts the table missed: one ping and one connection to a port it
   // already answered on make the system resolve the neighbour, then the table is read again.

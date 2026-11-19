@@ -82,6 +82,15 @@ export function gear(ip: string, sysName: string, spec: GearSpec): GearDevice {
 const sw = (ip: string, name: string, uplink: [string, string, string], extra: Partial<GearSpec> = {}) =>
   gear(ip, name, { ports: { p1: undefined, p2: undefined, p3: undefined, Vlan1: `${ip}/24` }, switches: true, hears: [['p1', uplink[0], uplink[1], uplink[2]]], ...extra });
 
+/** A switch that hears no neighbours: what it knows is the addresses (last octet of aa:00:00:00:04:xx) learned on each port. */
+const silent = (ip: string, name: string, mac: string, learned: Record<string, string[]>) =>
+  gear(ip, name, {
+    ports: { p1: undefined, p2: undefined, p3: undefined, Vlan1: `${ip}/24` },
+    switches: true,
+    mac,
+    learned: Object.entries(learned).flatMap(([port, ends]) => ends.map((end): [string, string] => [`aa:00:00:00:04:${end}`, port])),
+  });
+
 export const SCENARIOS: Scenario[] = [
   {
     id: 'flat',
@@ -241,5 +250,71 @@ export const SCENARIOS: Scenario[] = [
     network: { gatewayIp: '192.168.1.1', gatewayMac: 'aa:00:00:00:03:01', cidr: '192.168.1.0/24' },
     assets: [asset('192.168.1.1', 'router', 'aa:00:00:00:03:01'), asset('192.168.1.20', 'computer', 'aa:00:00:00:03:20'), asset('192.168.1.21', 'phone', 'aa:00:00:00:03:21')],
     devices: [],
+  },
+  {
+    id: 'silent-switches',
+    title: 'Three switches in a row that announce no neighbours, under a router that is not managed',
+    network: { gatewayIp: '192.168.1.1', gatewayMac: 'aa:00:00:00:04:01', cidr: '192.168.1.0/24' },
+    assets: [
+      asset('192.168.1.1', 'router', 'aa:00:00:00:04:01'),
+      asset('192.168.1.2', 'switch', 'aa:00:00:00:04:02'),
+      asset('192.168.1.3', 'switch', 'aa:00:00:00:04:03'),
+      asset('192.168.1.4', 'switch', 'aa:00:00:00:04:04'),
+      asset('192.168.1.20', 'computer', 'aa:00:00:00:04:20'),
+      asset('192.168.1.21', 'computer', 'aa:00:00:00:04:21'),
+      asset('192.168.1.22', 'computer', 'aa:00:00:00:04:22'),
+    ],
+    // Each switch learns everything above it on p1 and everything below it on p2; its own computer is on p3.
+    devices: [
+      silent('192.168.1.2', 'SW1', 'aa:00:00:00:04:02', { p1: ['01'], p2: ['03', '04', '21', '22'], p3: ['20'] }),
+      silent('192.168.1.3', 'SW2', 'aa:00:00:00:04:03', { p1: ['01', '02', '20'], p2: ['04', '22'], p3: ['21'] }),
+      silent('192.168.1.4', 'SW3', 'aa:00:00:00:04:04', { p1: ['01', '02', '03', '20', '21'], p3: ['22'] }),
+    ],
+  },
+  {
+    id: 'silent-under-dual-homed',
+    title: 'A switch that announces no neighbours, behind an access switch cabled to two cores',
+    network: { gatewayIp: '192.168.1.1', gatewayMac: 'aa:00:00:00:05:01', cidr: '192.168.1.0/24' },
+    assets: [
+      asset('192.168.1.1', 'switch', 'aa:00:00:00:05:01'),
+      asset('192.168.1.2', 'switch', 'aa:00:00:00:05:02'),
+      asset('192.168.1.3', 'switch', 'aa:00:00:00:05:03'),
+      asset('192.168.1.4', 'switch', 'aa:00:00:00:05:04'),
+      asset('192.168.1.20', 'computer', 'aa:00:00:00:05:20'),
+    ],
+    // ACC1 has two devices above it (both cores) and so does ACC2 (CORE1 and ACC1): CORE2 never
+    // learns ACC2, whose traffic takes the cable spanning tree leaves open.
+    devices: [
+      gear('192.168.1.1', 'CORE1', {
+        ports: { wan: '203.0.113.2/30', p1: undefined, p2: undefined, Vlan1: '192.168.1.1/24' },
+        routes: true,
+        switches: true,
+        mac: 'aa:00:00:00:05:01',
+        route: { nextHop: '203.0.113.1', port: 'wan' },
+        hears: [['p1', 'CORE2', '192.168.1.2', 'p1'], ['p2', 'ACC1', '192.168.1.3', 'p1']],
+        learned: [['aa:00:00:00:05:02', 'p1'], ['aa:00:00:00:05:03', 'p2'], ['aa:00:00:00:05:04', 'p2'], ['aa:00:00:00:05:20', 'p2']],
+      }),
+      gear('192.168.1.2', 'CORE2', {
+        ports: { p1: undefined, p2: undefined, Vlan1: '192.168.1.2/24' },
+        switches: true,
+        mac: 'aa:00:00:00:05:02',
+        hears: [['p1', 'CORE1', '192.168.1.1', 'p1'], ['p2', 'ACC1', '192.168.1.3', 'p2']],
+        learned: [['aa:00:00:00:05:01', 'p1'], ['aa:00:00:00:05:03', 'p2'], ['aa:00:00:00:05:20', 'p1']],
+      }),
+      gear('192.168.1.3', 'ACC1', {
+        ports: { p1: undefined, p2: undefined, p3: undefined, Vlan1: '192.168.1.3/24' },
+        switches: true,
+        mac: 'aa:00:00:00:05:03',
+        blocking: ['p2'],
+        hears: [['p1', 'CORE1', '192.168.1.1', 'p2'], ['p2', 'CORE2', '192.168.1.2', 'p2']],
+        learned: [['aa:00:00:00:05:01', 'p1'], ['aa:00:00:00:05:02', 'p1'], ['aa:00:00:00:05:04', 'p3'], ['aa:00:00:00:05:20', 'p3']],
+      }),
+      gear('192.168.1.4', 'ACC2', {
+        ports: { p1: undefined, p2: undefined, Vlan1: '192.168.1.4/24' },
+        switches: true,
+        mac: 'aa:00:00:00:05:04',
+        learned: [['aa:00:00:00:05:01', 'p1'], ['aa:00:00:00:05:02', 'p1'], ['aa:00:00:00:05:03', 'p1'], ['aa:00:00:00:05:20', 'p2']],
+      }),
+    ],
   },
 ];

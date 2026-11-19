@@ -1,6 +1,5 @@
-import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
+import { useEffect, useState, type ComponentType, type ReactNode, type SVGProps } from 'react';
 import {
-  BrickWall,
   CircleAlert,
   CircleCheck,
   CircleHelp,
@@ -13,29 +12,27 @@ import {
   Info,
   Laptop,
   Monitor,
-  Network,
   OctagonAlert,
   Printer,
-  Router,
   Server,
   Smartphone,
   Tablet,
   TriangleAlert,
   Tv,
-  Wifi,
   X,
   type LucideProps,
 } from 'lucide-react';
 import type { Asset, DeviceType, Severity } from '@shared/types';
+import { AccessPointIcon, FirewallIcon, RouterIcon, RoutingSwitchIcon, SegmentIcon, SwitchIcon } from './icons';
 import { useStore } from './store';
 
-type Icon = ComponentType<LucideProps>;
+type Icon = ComponentType<LucideProps> | ComponentType<SVGProps<SVGSVGElement>>;
 
 const DEVICE: Record<DeviceType, { icon: Icon; tile: string; label: string }> = {
-  router: { icon: Router, tile: 'router', label: 'Router' },
-  switch: { icon: Network, tile: 'switch', label: 'Switch' },
-  firewall: { icon: BrickWall, tile: 'firewall', label: 'Firewall' },
-  ap: { icon: Wifi, tile: 'ap', label: 'Access point' },
+  router: { icon: RouterIcon, tile: 'router', label: 'Router' },
+  switch: { icon: SwitchIcon, tile: 'switch', label: 'Switch' },
+  firewall: { icon: FirewallIcon, tile: 'firewall', label: 'Firewall' },
+  ap: { icon: AccessPointIcon, tile: 'ap', label: 'Access point' },
   server: { icon: Server, tile: 'server', label: 'Server' },
   vm: { icon: Box, tile: 'server', label: 'Virtual machine' },
   computer: { icon: Monitor, tile: 'endpoint', label: 'Computer' },
@@ -54,10 +51,15 @@ export function typeLabel(type: DeviceType): string {
   return DEVICE[type].label;
 }
 
-export function DeviceTile({ type, size }: { type: DeviceType; size?: 'sm' | 'lg' }) {
-  const { icon: I, tile } = DEVICE[type];
+/**
+ * The coloured tile of a device type. `as` draws a switch that routes between its networks, or a
+ * stretch of network nobody manages, in place of the plain icon of the type.
+ */
+export function DeviceTile({ type, size, as }: { type: DeviceType; size?: 'sm' | 'lg'; as?: 'routing' | 'segment' }) {
+  const { icon, tile } = DEVICE[type];
+  const I = (as === 'segment' ? SegmentIcon : as === 'routing' && type === 'switch' ? RoutingSwitchIcon : icon) as ComponentType<{ className?: string }>;
   return (
-    <div className={`dev ${size ?? ''}`} style={{ background: `var(--device-${tile})` }} aria-hidden>
+    <div className={`dev ${size ?? ''}`} style={{ background: `var(--device-${as === 'segment' ? 'endpoint' : tile})` }} aria-hidden>
       <I className="icon" />
     </div>
   );

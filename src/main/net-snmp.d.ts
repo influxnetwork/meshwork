@@ -15,6 +15,7 @@ declare module 'net-snmp' {
 
   interface Session {
     get(oids: string[], callback: (error: Error | null, varbinds: Varbind[]) => void): void;
+    getNext(oids: string[], callback: (error: Error | null, varbinds: Varbind[]) => void): void;
     subtree(
       oid: string,
       maxRepetitions: number,
@@ -27,6 +28,11 @@ declare module 'net-snmp' {
 
   const snmp: {
     Version2c: number;
+    ErrorStatus: { NoSuchName: number };
+    /** No answer arrived after every try. */
+    RequestTimedOutError: new (message: string) => Error;
+    /** The agent answered with an error status. */
+    RequestFailedError: new (message: string, status: number) => Error & { status: number };
     createSession(target: string, community: string, options?: SessionOptions): Session;
     isVarbindError(varbind: Varbind): boolean;
   };

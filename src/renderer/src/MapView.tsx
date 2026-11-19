@@ -47,7 +47,6 @@ import {
   Search,
   X,
   RefreshCw,
-  Router,
   Waypoints,
   Wifi,
   Zap,
@@ -55,10 +54,11 @@ import {
 import type { Asset, DeviceType, GearSnapshot, SnmpSettings } from '@shared/types';
 import { describeLoop, findLoops } from '@shared/loops';
 import { inCidr } from '@shared/report';
-import { unscannedNetworks } from '@shared/unscanned';
+import { scannedRanges, unscannedNetworks } from '@shared/unscanned';
 import { describeMismatch, findLinkMismatches, mismatchAdvice } from '@shared/link-mismatch';
 import { cleanError } from './store';
 import { useStore } from './store';
+import { RouterIcon } from './icons';
 import { DeviceTile, EmptyState, displayName, relativeTime } from './ui';
 import { Detail, NodeDetail } from './Inventory';
 import { ReportDialog, type MapCapture } from './ReportDialog';
@@ -73,6 +73,7 @@ import {
   isPhysicalPort,
   layoutTree,
   placeCableLabels,
+  gatewayLine,
   searchMap,
   vlanLabel,
   type Attachment,
@@ -84,6 +85,7 @@ import {
   type MapSearchEntry,
   type NodeFacts,
   type Positions,
+  type SharedGateway,
   type Side,
 } from './map-model';
 import { toCsv } from '@shared/csv';
@@ -139,6 +141,8 @@ function readJson<T extends object>(key: string, fallback: T): T {
 interface DeviceData extends Record<string, unknown> {
   asset?: Asset;
   ip?: string;
+  /** Gateway addresses the router shares with others and holds. */
+  gateways?: SharedGateway[];
   /** Name, detail and type for devices that are not in the inventory. */
   label?: string;
   detail?: string;
@@ -148,8 +152,12 @@ interface DeviceData extends Record<string, unknown> {
   announced?: boolean;
   /** True when `deviceType` comes from the device's own reading. */
   typeRead?: boolean;
+  /** A stretch of network nobody manages, drawn where several devices share one switch port. */
+  segment?: boolean;
   /** True for the computer the map is drawn from. */
   self?: boolean;
+  /** A loop found on this switch, told on its card. */
+  loop?: string;
   /** Address range of a separate network behind the gateway. */
   network?: string;
   /** Traffic on a contained device's switch port, in bits per second. */
@@ -212,6 +220,8 @@ interface LinkData extends Record<string, unknown> {
   vlanColors?: string[];
   /** A redundant cable (it closes a ring): whether spanning tree blocks it, and on which end. */
   redundant?: { blocked: boolean; blockedEnd?: 'source' | 'target' };
+  /** A link bundle: how many cables it is made of and their ports at each end, shown on hover. */
+  bundle?: { cables: number; sourcePorts?: string[]; targetPorts?: string[] };
 }
 
 const POSITION: Record<Side, Position> = { top: Position.Top, right: Position.Right, bottom: Position.Bottom, left: Position.Left };
@@ -240,6 +250,9 @@ function YouBadge() {
 
 function DeviceNode({ data, selected }: NodeProps<Node<DeviceData>>) {
   const a = data.asset;
+  // The line of shared gateway addresses shows their detail while the pointer or the keyboard is on it.
+  const [sharedAt, sharedProps] = useTipAt<HTMLSpanElement>();
+  const [loopTipAt, loopProps] = useTipAt<HTMLSpanElement>();
   const sub = [data.showIp ? (a?.ip ?? data.ip) : undefined, data.showVendor && a?.vendor && a.vendor !== 'Private address' ? a.vendor : undefined]
     .filter(Boolean)
     .join(' · ');
@@ -248,23 +261,28 @@ function DeviceNode({ data, selected }: NodeProps<Node<DeviceData>>) {
   const name =
     ((data.managed || data.announced) && data.label) ||
     a?.hostname ||
-    (known && known !== a?.ip ? known : (data.label ?? known ?? (data.gateway ? 'Gateway' : 'Unknown device')));
+    (known && known !== a?.ip ? known : (data.label ?? known ?? (data.gateway || data.gateways?.length ? 'Gateway' : 'Unknown device')));
   // A type the device announced over LLDP beats the scan's guess.
   const type = (data.announced || data.typeRead) && data.deviceType && data.deviceType !== 'unknown' ? data.deviceType : a?.type && a.type !== 'unknown' ? a.type : data.deviceType;
   return (
-    <div className={`map-node device${data.gateway ? ' gateway' : ''}${data.routes?.length ? ' routes' : ''}${data.self ? ' self' : ''}${selected ? ' selected' : ''}`} title={data.detail}>
+    <div className={`map-node device${data.gateway ? ' gateway' : ''}${data.routes?.length ? ' routes' : ''}${data.gateways?.length ? ' shared' : ''}${data.self ? ' self' : ''}${selected ? ' selected' : ''}`} title={data.detail}>
       <Handle type="target" position={Position.Top} style={hidden} isConnectable={false} />
       {data.managed && <span className="map-managed">SNMP</span>}
+      {data.loop && (
+        <span className="map-loop-mark" role="note" aria-label={data.loop} {...loopProps}>
+          <AlertTriangle className="icon" aria-hidden /> Loop
+        </span>
+      )}
       {data.self && <YouBadge />}
       {data.network ? (
         <div className="map-glyph net">
           <NetworkIcon className="icon" />
         </div>
       ) : type ? (
-        <DeviceTile type={type} size="sm" />
+        <DeviceTile type={type} size="sm" as={data.segment ? 'segment' : data.routes?.length ? 'routing' : undefined} />
       ) : (
         <div className="map-glyph">
-          <Router className="icon" />
+          <RouterIcon className="icon" />
         </div>
       )}
       <div className="map-text">
@@ -290,6 +308,20 @@ function DeviceNode({ data, selected }: NodeProps<Node<DeviceData>>) {
             ))}
           </div>
         ) : null}
+        {data.gateways?.length ? (
+          <span className="map-shared" {...sharedProps}>
+            {gatewayLine(data.gateways)}
+          </span>
+        ) : null}
+        {sharedAt && data.gateways?.length ? createPortal(<GatewaysTip at={sharedAt} gateways={data.gateways} />, document.body) : null}
+        {loopTipAt && data.loop
+          ? createPortal(
+              <AnchoredTip at={loopTipAt} title="Loop on this switch">
+                <span className="map-port-tip-row">{data.loop.replace(/^Loop: /, '')}</span>
+              </AnchoredTip>,
+              document.body,
+            )
+          : null}
       </div>
       {a?.risks.length ? <span className="map-risk" title={`${a.risks.length} ${a.risks.length === 1 ? 'risk' : 'risks'}`} /> : null}
       <Handle type="source" position={Position.Bottom} style={hidden} isConnectable={false} />
@@ -460,11 +492,18 @@ const cableLabelBoxes = (() => {
   };
 })();
 
-/** Text in the middle of a cable: what spanning tree does on a redundant one; else PoE and traffic. */
+/** The ports a link bundle is made of at one end, beside the name of the bundle: " (Et0/2, Et0/3)", or their number when they are many. */
+function bundlePorts(ports?: string[]): string {
+  if (!ports?.length) return '';
+  return ports.length > 4 ? ` (${ports.length} ports)` : ` (${ports.join(', ')})`;
+}
+
+/** Text in the middle of a cable: what spanning tree does on a redundant one, or that it is a link bundle; else PoE and traffic. */
 function middleLabel(data?: LinkData): string[] {
-  if (data?.redundant) return [data.redundant.blocked ? 'Blocked by spanning tree' : 'Redundant link'];
+  const bundle = data?.bundle ? `Link bundle · ${data.bundle.cables} cables` : '';
+  if (data?.redundant) return [data.redundant.blocked ? 'Blocked by spanning tree' : bundle || 'Redundant link'];
   const rate = data?.rate ?? 0;
-  return [data?.tunnel ? 'Tunnel' : '', data?.poe ? (data.poeWatts ? `${data.poeWatts} W` : 'PoE') : '', rate >= FLOW_MIN_BPS ? formatRate(rate) : ''].filter(Boolean);
+  return [bundle, data?.tunnel ? 'Tunnel' : '', data?.poe ? (data.poeWatts ? `${data.poeWatts} W` : 'PoE') : '', rate >= FLOW_MIN_BPS ? formatRate(rate) : ''].filter(Boolean);
 }
 
 /**
@@ -472,6 +511,63 @@ function middleLabel(data?: LinkData): string[] {
  * It is drawn over the whole window so device cards never cover it, and kept inside the window.
  */
 function RoutesTip({ at, port, routes }: { at: DOMRect; port?: string; routes: { vlan?: number; network: string; ip: string; port: string }[] }) {
+  return (
+    <AnchoredTip at={at} title={`Networks routed on ${port}`}>
+      {routes.map((r) => (
+        <span key={`${r.port}|${r.ip}`} className="map-port-tip-row">
+          <span>{r.port}</span>
+          <span>{`${r.ip}/${r.network.split('/')[1]}`}</span>
+          <span>{r.vlan !== undefined ? `VLAN ${r.vlan}` : ''}</span>
+        </span>
+      ))}
+    </AnchoredTip>
+  );
+}
+
+/** The shared gateway addresses a router holds: address, network and VLAN, and whether the last reading shows it answering. */
+function GatewaysTip({ at, gateways }: { at: DOMRect; gateways: SharedGateway[] }) {
+  return (
+    <AnchoredTip at={at} title="Gateway addresses shared with other routers">
+      {gateways.map((g) => (
+        <span key={g.ip} className="map-port-tip-row">
+          <span>{`${g.ip} · ${g.protocol}`}</span>
+          <span>{`${g.network}${g.vlan !== undefined ? ` · VLAN ${g.vlan}` : ''}`}</span>
+          <span>{g.active ? 'answers for it (last reading)' : 'who answers for it was not read'}</span>
+        </span>
+      ))}
+    </AnchoredTip>
+  );
+}
+
+/**
+ * Where on screen the element a tip belongs to is, while the pointer or the keyboard is on it, and
+ * the properties that element takes. The map moving under the pointer (a zoom, a drag, a click)
+ * would leave the tip in the wrong place: it closes.
+ */
+function useTipAt<T extends HTMLElement>() {
+  const [at, setAt] = useState<DOMRect>();
+  useEffect(() => {
+    if (!at) return;
+    const close = () => setAt(undefined);
+    window.addEventListener('wheel', close, { passive: true });
+    window.addEventListener('pointerdown', close);
+    return () => {
+      window.removeEventListener('wheel', close);
+      window.removeEventListener('pointerdown', close);
+    };
+  }, [at]);
+  const props = {
+    tabIndex: 0,
+    onMouseEnter: (e: React.MouseEvent<T>) => setAt(e.currentTarget.getBoundingClientRect()),
+    onMouseLeave: () => setAt(undefined),
+    onFocus: (e: React.FocusEvent<T>) => setAt(e.currentTarget.getBoundingClientRect()),
+    onBlur: () => setAt(undefined),
+  };
+  return [at, props] as const;
+}
+
+/** A tip of three-column rows under a title, beside the element at `at`, kept inside the window. */
+function AnchoredTip({ at, title, children }: { at: DOMRect; title: string; children: React.ReactNode }) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ left: at.right + 8, top: at.top });
   useLayoutEffect(() => {
@@ -484,14 +580,8 @@ function RoutesTip({ at, port, routes }: { at: DOMRect; port?: string; routes: {
   }, [at]);
   return (
     <div ref={ref} className="map-port-tip" role="tooltip" style={pos}>
-      <b>Networks routed on {port}</b>
-      {routes.map((r) => (
-        <span key={`${r.port}|${r.ip}`} className="map-port-tip-row">
-          <span>{r.port}</span>
-          <span>{`${r.ip}/${r.network.split('/')[1]}`}</span>
-          <span>{r.vlan !== undefined ? `VLAN ${r.vlan}` : ''}</span>
-        </span>
-      ))}
+      <b>{title}</b>
+      {children}
     </div>
   );
 }
@@ -583,27 +673,9 @@ function LinkEdge(props: EdgeProps<Edge<LinkData>>) {
   const redundant = data?.redundant;
   const middle = middleLabel(data);
   const subinterfaces = data?.routes?.filter((r) => r.vlan !== undefined).length ?? 0;
-  const [tipAt, setTipAt] = useState<DOMRect>();
   // The port that carries the routed networks shows them while the pointer or the keyboard is on it.
   const routedAt = data?.routes?.length ? (data.routesAtTarget ? 'target' : 'source') : undefined;
-  const tipProps = {
-    tabIndex: 0,
-    onMouseEnter: (e: React.MouseEvent<HTMLDivElement>) => setTipAt(e.currentTarget.getBoundingClientRect()),
-    onMouseLeave: () => setTipAt(undefined),
-    onFocus: (e: React.FocusEvent<HTMLDivElement>) => setTipAt(e.currentTarget.getBoundingClientRect()),
-    onBlur: () => setTipAt(undefined),
-  };
-  // The map moving under the pointer leaves the box in the wrong place: it closes.
-  useEffect(() => {
-    if (!tipAt) return;
-    const close = () => setTipAt(undefined);
-    window.addEventListener('wheel', close, { passive: true });
-    window.addEventListener('pointerdown', close);
-    return () => {
-      window.removeEventListener('wheel', close);
-      window.removeEventListener('pointerdown', close);
-    };
-  }, [tipAt]);
+  const [tipAt, tipProps] = useTipAt<HTMLDivElement>();
   return (
     <>
       <path ref={measure} d={path} fill="none" stroke="none" aria-hidden />
@@ -632,11 +704,13 @@ function LinkEdge(props: EdgeProps<Edge<LinkData>>) {
           <div
             ref={srcRef}
             className={`map-port src${redundant?.blockedEnd === 'source' ? ' blocked' : ''}${routedAt === 'source' ? ' has-tip' : ''}`}
-            title={redundant?.blockedEnd === 'source' ? 'Spanning tree blocks this port' : routedAt === 'source' ? undefined : data.sourcePortsAll}
+            title={redundant?.blockedEnd === 'source' ? 'Spanning tree blocks this port' : routedAt === 'source' ? undefined : (data.sourcePortsAll ?? data.bundle?.sourcePorts?.join(', '))}
             style={{ transform: onLine(srcAt, sx, sy) }}
             {...(routedAt === 'source' ? tipProps : {})}
           >
             {data.sourcePort}
+            {bundlePorts(data.bundle?.sourcePorts)}
+            {data.vlanText ? <span className="map-vlan-tag"> · {data.vlanText}</span> : null}
             {routedAt === 'source' && subinterfaces ? <span className="map-sub-count"> ({subinterfaces})</span> : null}
           </div>
         )}
@@ -647,11 +721,12 @@ function LinkEdge(props: EdgeProps<Edge<LinkData>>) {
           <div
             ref={dstRef}
             className={`map-port dst${redundant?.blockedEnd === 'target' ? ' blocked' : ''}${routedAt === 'target' ? ' has-tip' : ''}`}
-            title={redundant?.blockedEnd === 'target' ? 'Spanning tree blocks this port' : undefined}
+            title={redundant?.blockedEnd === 'target' ? 'Spanning tree blocks this port' : data.bundle?.targetPorts?.join(', ')}
             style={{ transform: onLine(dstAt, tx, ty) }}
             {...(routedAt === 'target' ? tipProps : {})}
           >
             {data.targetPort}
+            {bundlePorts(data.bundle?.targetPorts)}
             {routedAt === 'target' && subinterfaces ? <span className="map-sub-count"> ({subinterfaces})</span> : null}
           </div>
         )}
@@ -664,6 +739,7 @@ function LinkEdge(props: EdgeProps<Edge<LinkData>>) {
             {...(routedAt === 'target' ? tipProps : {})}
           >
             <span aria-hidden>↑</span> {data.targetPort}
+            {bundlePorts(data.bundle?.targetPorts)}
             {routedAt === 'target' && subinterfaces ? <span className="map-sub-count"> ({subinterfaces})</span> : null}
           </div>
         )}
@@ -1136,7 +1212,7 @@ function MapCanvas() {
   const scanInto = useStore((s) => s.scanInto);
   const scanning = useStore((s) => s.scan.running);
   const unscanned = useMemo(
-    () => (network && gear?.devices.length ? unscannedNetworks(gear.devices, network.cidr, members.map((a) => a.ip)) : []),
+    () => (network && gear?.devices.length ? unscannedNetworks(gear.devices, scannedRanges(network), members.map((a) => a.ip)) : []),
     [network, gear, members],
   );
   const scanNetwork = useCallback((cidr: string) => (currentId ? void scanInto(currentId, cidr) : undefined), [currentId, scanInto]);
@@ -1182,6 +1258,9 @@ function MapCanvas() {
   const fullIndex = useMemo(() => {
     const byId = new Map(fullTopo.nodes.map((n) => [n.id, n]));
     const byAsset = new Map(fullTopo.nodes.filter((n) => n.assetId).map((n) => [n.assetId as string, n]));
+    // A node named after one inventory device and drawn as another (a gateway address routers
+    // share, on the router that holds it) is found by either.
+    for (const n of fullTopo.nodes) if (!byAsset.has(n.id)) byAsset.set(n.id, n);
     const members = new Map<string, number>();
     for (const n of fullTopo.nodes) if (n.parent) members.set(n.parent, (members.get(n.parent) ?? 0) + 1);
     return { byId, byAsset, members };
@@ -1192,6 +1271,7 @@ function MapCanvas() {
       const assetId = fullIndex.byId.get(r.id)?.assetId;
       if (assetId) out.set(assetId, r);
     }
+    for (const r of connections) if (!out.has(r.id)) out.set(r.id, r);
     return out;
   }, [connections, fullIndex]);
   // A drawer whose device is no longer on the map (a rescan, another network) closes instead of lingering.
@@ -1250,6 +1330,14 @@ function MapCanvas() {
     return attachLinks(boxes, [...topo.edges, ...redundantShown, ...(topo.peers ?? [])]);
   }, [nodes, layout, topo.edges, topo.peers, redundantShown]);
 
+  // Loops are told on the card of the switch they are on, besides the list beside the map.
+  const loops = useMemo(() => findLoops(gear?.devices ?? []), [gear]);
+  const loopAt = useMemo(() => {
+    const byIp = new Map(loops.map((l) => [l.switchIp, `Loop: ${describeLoop(l)}`]));
+    const out = new Map<string, string>();
+    if (byIp.size) for (const n of topo.nodes) if (n.managed) for (const ip of [n.ip, n.assetId !== undefined ? assets[n.assetId]?.ip : undefined]) if (ip && byIp.has(ip)) out.set(n.id, byIp.get(ip) as string);
+    return out;
+  }, [loops, topo.nodes, assets]);
   useEffect(() => {
     const label = (n: MapNode) => n.title ?? CATEGORIES.find((c) => c.id === n.category)?.label ?? 'Devices';
     setNodes(
@@ -1277,7 +1365,9 @@ function MapCanvas() {
           managed: n.managed,
           announced: n.announced,
           typeRead: n.typeRead,
+          segment: n.id.startsWith('segment:') || undefined,
           self: n.self,
+          loop: loopAt.get(n.id),
           network: n.network,
           port: n.port,
           poe: n.poe,
@@ -1291,13 +1381,14 @@ function MapCanvas() {
           onVlan: showVlan,
           showIp: prefs.ip,
           showVendor: prefs.vendor,
-          gateway: n.kind === 'gateway',
+          gateway: n.kind === 'gateway' && !n.sharedGateway,
+          gateways: n.parent ? undefined : n.gateways,
         };
         if (n.parent) return { id: n.id, type: 'member', position, data, className, parentId: n.parent, extent: 'parent', draggable: false };
         return { id: n.id, type: 'device', position, data, className };
       }),
     );
-  }, [topo, layout, saved, assets, prefs.ip, prefs.vendor, toggleGroup, inVlan, vlanColor, traffic, liveOn, vlanFilter, showVlan, unscanned, scanning, scanNetwork]);
+  }, [topo, layout, saved, assets, prefs.ip, prefs.vendor, toggleGroup, inVlan, vlanColor, traffic, liveOn, vlanFilter, showVlan, unscanned, scanning, scanNetwork, loopAt]);
 
   /**
    * Traffic on a cable to a group: the total of its devices, shown only while at least one of them is
@@ -1329,6 +1420,7 @@ function MapCanvas() {
             routes: e.routes,
             routesAtTarget: e.routesAtTarget,
             tunnel: e.tunnel,
+            bundle: e.bundle,
             targetPort: e.targetPort,
             poe: e.poe,
             poeWatts: e.poeWatts,
@@ -1366,6 +1458,7 @@ function MapCanvas() {
             at: attachments.get(e.id),
             dim: !!inVlan && !inVlan.edges.has(e.id),
             redundant: { blocked: e.stp === 'blocked', blockedEnd: e.blockedPort ? (e.blockedPort.node === e.source ? 'source' : 'target') : undefined },
+            bundle: e.bundle,
           },
         }),
       ),
@@ -1391,6 +1484,7 @@ function MapCanvas() {
             peer: true,
             tunnel: e.tunnel,
             vlanText: vlanLabel(e.vlan),
+            bundle: e.bundle,
           },
         }),
       ),
@@ -1629,10 +1723,9 @@ function MapCanvas() {
   const openedNode = openId ? fullIndex.byAsset.get(openId) : undefined;
   const openedGear =
     openedNode && (openedNode.managed || openedNode.announced)
-      ? { name: openedNode.label, description: openedNode.detail, type: openedNode.deviceType, source: gearSource(openedNode) }
+      ? { name: openedNode.label, description: openedNode.detail, type: openedNode.deviceType, source: gearSource(openedNode), gateways: openedNode.gateways }
       : undefined;
   const risky = members.filter((a) => a.risks.length).length;
-  const loops = findLoops(gear?.devices ?? []);
   const mismatches = findLinkMismatches(gear?.devices ?? []);
 
   return (
@@ -1774,7 +1867,7 @@ function MapCanvas() {
                               disabled={!nodeId}
                               title={d.sysDescr ? `${d.sysDescr}\nShow on the map` : 'Show on the map'}
                             >
-                              <DeviceTile type={role.startsWith('Switch') ? 'switch' : 'router'} size="sm" />
+                              <DeviceTile type={role.startsWith('Switch') ? 'switch' : 'router'} size="sm" as={d.forwarding ? 'routing' : undefined} />
                               <span className="gear-text">
                                 <b>{d.sysName ?? d.ip}</b>
                                 <span>

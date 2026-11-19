@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.5.21-6366f1">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.5.22-6366f1">
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-334155">
   <img alt="Licence" src="https://img.shields.io/badge/licence-GPL--3.0-16a34a">
   <img alt="Status" src="https://img.shields.io/badge/status-pre--1.0-f59e0b">
@@ -53,7 +53,7 @@ If it is useful to you, take it. If it gets something wrong on your equipment, a
 evidence (see *Contributing*) is the best way to make it better. It will keep improving one
 release at a time.
 
-## What it does today (0.5.21)
+## What it does today (0.5.22)
 
 ### Discover
 
@@ -115,6 +115,13 @@ The map is drawn automatically from scans and from switches and routers read ove
   Choosing a VLAN highlights the router, cables and devices that belong to it.
 - Two cables between the same two devices are drawn separately. A link whose two ends disagree
   on native VLAN or duplex raises a warning on the map and a finding in the report.
+- **Link bundles** (LACP or static) are drawn as one link, named with the ports it is made of.
+  Switches cabled to two cores stand under both, with their cables kept apart.
+- **Redundant gateways**: a router that holds a gateway address it shares with others (HSRP,
+  VRRP, GLBP) says so on its card, with the protocol and whether it answers for it.
+- **Switches that announce no neighbours** are placed from the addresses they learned, and a
+  Wi-Fi extender that rewrites the addresses behind it is drawn under the access point it
+  repeats, with its devices under it.
 - **Loops and spanning tree**: port states are read over SNMP. Redundant cables are drawn dotted,
   with the port spanning tree blocks. A ring with no blocked port, or a switch that hears its own
   addresses on two ports, raises a warning with the ports to unplug.

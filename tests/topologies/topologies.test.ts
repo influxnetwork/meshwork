@@ -40,6 +40,36 @@ describe('topologies the map draws', () => {
     expect(m.topo.roots).toEqual(['internet']);
   });
 
+  it('switches that announce no neighbours: joined in a row by the addresses each learned, every computer on its own switch', () => {
+    const m = draw('silent-switches');
+    expect(m.link('192.168.1.1', 'SW1')).toMatchObject({ inferred: false, targetPort: 'p1' });
+    expect(m.link('SW1', 'SW2')).toMatchObject({ inferred: false, sourcePort: 'p2', targetPort: 'p1' });
+    expect(m.link('SW2', 'SW3')).toMatchObject({ inferred: false, sourcePort: 'p2', targetPort: 'p1' });
+    expect(m.link('192.168.1.1', 'SW2')).toBeUndefined();
+    expect(m.link('192.168.1.1', 'SW3')).toBeUndefined();
+    expect(m.holderOf('192.168.1.20')).toBe(m.node('SW1'));
+    expect(m.holderOf('192.168.1.21')).toBe(m.node('SW2'));
+    expect(m.holderOf('192.168.1.22')).toBe(m.node('SW3'));
+    expect(m.topo.nodes.filter((n) => n.label === 'Unmanaged segment')).toEqual([]);
+  });
+
+  it('a switch that announces no neighbours behind an access switch cabled to two cores: plugged into that access switch, in every reading order', () => {
+    const s = SCENARIOS.find((x) => x.id === 'silent-under-dual-homed') as Scenario;
+    const original = [...s.devices];
+    try {
+      for (const order of [original, [...original].reverse(), [...original.slice(2), ...original.slice(0, 2)]]) {
+        s.devices.splice(0, s.devices.length, ...order);
+        const m = draw('silent-under-dual-homed');
+        expect(m.link('ACC1', 'ACC2')).toMatchObject({ inferred: false, sourcePort: 'p3', targetPort: 'p1' });
+        expect(m.link('CORE1', 'ACC2')).toBeUndefined();
+        expect(m.link('CORE1', 'ACC1')).toMatchObject({ sourcePort: 'p2', targetPort: 'p1' });
+        expect(m.holderOf('192.168.1.20')).toBe(m.node('ACC2'));
+      }
+    } finally {
+      s.devices.splice(0, s.devices.length, ...original);
+    }
+  });
+
   it('nothing managed: the gateway under an assumed internet', () => {
     const m = draw('unread-gateway');
     expect(m.exits).toHaveLength(1);
@@ -174,5 +204,18 @@ describe('topologies the map draws', () => {
     });
   });
 
-  it.todo('virtual gateway: the two routers are drawn as a pair, not under an address no device owns');
+  it('virtual gateway: the address two routers share is drawn on one of them, not as a device of its own', () => {
+    const m = draw('virtual-gateway');
+    // Each router keeps its own way out; nothing else heads a tree.
+    expect(m.exits).toHaveLength(2);
+    expect(m.exitOf('R1')?.link).toMatchObject({ inferred: false, targetPort: 'wan' });
+    expect(m.exitOf('R2')?.link).toMatchObject({ inferred: false, targetPort: 'wan' });
+    // The shared address is the router with the lowest address, which is the gateway of the map.
+    const gateways = m.topo.nodes.filter((n) => n.kind === 'gateway');
+    expect(gateways).toMatchObject([{ label: 'R1', managed: true }]);
+    expect(m.node('10.0.0.1')).toBe(m.node('R1'));
+    // The switch hangs from one router and is joined to the other.
+    expect(m.link('R1', 'SW1')).toMatchObject({ sourcePort: 'lan', targetPort: 'p1' });
+    expect(m.topo.peers).toMatchObject([{ source: m.node('SW1'), target: m.node('R2'), sourcePort: 'p2', targetPort: 'lan' }]);
+  });
 });

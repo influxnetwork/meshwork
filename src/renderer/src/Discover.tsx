@@ -59,13 +59,21 @@ function TargetEditor({ disabled }: { disabled: boolean }) {
   const setSettings = useStore((s) => s.setSettings);
   const [draft, setDraft] = useState('');
   const [invalid, setInvalid] = useState<Set<string>>(new Set());
+  const [oversized, setOversized] = useState<Set<string>>(new Set());
   const inputRef = useRef<HTMLInputElement>(null);
   const tokens = useMemo(() => splitTokens(targets), [targets]);
 
   useEffect(() => {
     let alive = true;
-    void Promise.all(tokens.map(async (t) => [t, (await window.api.scan.parseTargets(t)).errors.length > 0] as const)).then((rows) => {
-      if (alive) setInvalid(new Set(rows.filter(([, bad]) => bad).map(([t]) => t)));
+    void Promise.all(
+      tokens.map(async (t) => {
+        const r = await window.api.scan.parseTargets(t);
+        return [t, r.errors.length > 0, r.tooLarge] as const;
+      }),
+    ).then((rows) => {
+      if (!alive) return;
+      setInvalid(new Set(rows.filter(([, bad]) => bad).map(([t]) => t)));
+      setOversized(new Set(rows.filter(([, , big]) => big).map(([t]) => t)));
     });
     return () => {
       alive = false;
@@ -90,7 +98,7 @@ function TargetEditor({ disabled }: { disabled: boolean }) {
   return (
     <div className="box" onClick={() => inputRef.current?.focus()}>
       {tokens.map((t) => (
-        <span key={t} className={`tchip ${invalid.has(t) ? 'bad' : ''}`} title={invalid.has(t) ? 'Not a valid IP, range or CIDR block' : undefined}>
+        <span key={t} className={`tchip ${invalid.has(t) || oversized.has(t) ? 'bad' : ''}`} title={invalid.has(t) ? 'Not a valid IP, range or CIDR block' : oversized.has(t) ? 'Too many addresses for one scan' : undefined}>
           {t}
           {!disabled && (
             <button aria-label={`Remove ${t}`} onClick={() => remove(t)}>
@@ -182,7 +190,16 @@ function ScanControls() {
   useEffect(() => {
     void window.api.scan
       .parseTargets(settings.targets)
-      .then((r) => setCount({ n: r.count, error: r.tooLarge ? 'Too many addresses for one scan (limit 65,536).' : r.errors[0] }));
+      .then((r) =>
+        setCount({
+          n: r.count,
+          error: r.largest
+            ? `${r.largest.target} has ${r.largest.count.toLocaleString('en-US')} addresses: too many for one scan (limit 65,536). Check its prefix.`
+            : r.tooLarge
+              ? `Too many addresses for one scan: ${r.count.toLocaleString('en-US')} (limit 65,536).`
+              : r.errors[0],
+        }),
+      );
   }, [settings.targets]);
 
   const tokens = splitTokens(settings.targets);

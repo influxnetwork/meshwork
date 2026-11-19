@@ -180,6 +180,81 @@ describe('map link attachment', () => {
     expect(b.sx > a.sx && (b.turn ?? 0) < (a.turn ?? 0)).toBe(true);
   });
 
+  describe('cables of different devices in one row', () => {
+    const card = (x: number, y: number, h = 52): Box => ({ x, y, w: 216, h });
+    type Run = { link: string; x1: number; x2: number; y: number };
+    type Drop = { link: string; x: number; y1: number; y2: number };
+    /** The straight stretches of every cable: its level run and the two drops at its ends. */
+    const stretches = (at: ReturnType<typeof attachLinks>) => {
+      const runs: Run[] = [];
+      const drops: Drop[] = [];
+      for (const [link, a] of at) {
+        const turn = a.turn ?? (a.sy + a.ty) / 2;
+        if (Math.abs(a.sx - a.tx) > 1) runs.push({ link, x1: Math.min(a.sx, a.tx), x2: Math.max(a.sx, a.tx), y: turn });
+        drops.push({ link, x: a.sx, y1: Math.min(a.sy, turn), y2: Math.max(a.sy, turn) }, { link, x: a.tx, y1: Math.min(turn, a.ty), y2: Math.max(turn, a.ty) });
+      }
+      return { runs, drops };
+    };
+    /** Pairs of cables that run over each other for a stretch. */
+    const covering = (at: ReturnType<typeof attachLinks>) => {
+      const { runs, drops } = stretches(at);
+      const out: string[] = [];
+      for (const [i, p] of runs.entries()) for (const q of runs.slice(i + 1)) if (p.link !== q.link && Math.abs(p.y - q.y) < 12 && Math.min(p.x2, q.x2) - Math.max(p.x1, q.x1) > 4) out.push(`${p.link} over ${q.link} at y ${p.y}`);
+      for (const [i, p] of drops.entries()) for (const q of drops.slice(i + 1)) if (p.link !== q.link && Math.abs(p.x - q.x) < 8 && Math.min(p.y2, q.y2) - Math.max(p.y1, q.y1) > 4) out.push(`${p.link} over ${q.link} at x ${p.x}`);
+      return out;
+    };
+    const cables = [
+      { id: 'c1a1', source: 'c1', target: 'a1' },
+      { id: 'c1a2', source: 'c1', target: 'a2' },
+      { id: 'c2a1', source: 'c2', target: 'a1' },
+      { id: 'c2a2', source: 'c2', target: 'a2' },
+    ];
+
+    it('two switches each under one of two routers, cabled to both: no cable runs over another, and the straight ones stay straight', () => {
+      const boxes = new Map<string, Box>([['c1', card(0, 0, 92)], ['c2', card(360, 0, 92)], ['a1', card(0, 420)], ['a2', card(360, 420)]]);
+      const at = attachLinks(boxes, cables);
+      expect(covering(at)).toEqual([]);
+      expect(at.get('c1a1')!.sx).toBe(at.get('c1a1')!.tx);
+      expect(at.get('c2a2')!.sx).toBe(at.get('c2a2')!.tx);
+      // Every end stays on its card.
+      for (const a of at.values()) {
+        expect(a.sx).toBeGreaterThanOrEqual(0);
+        expect(a.tx).toBeLessThanOrEqual(576);
+      }
+    });
+
+    it('both switches under the first router: the cables of the second run at heights of their own', () => {
+      const boxes = new Map<string, Box>([['c1', card(120, 0, 92)], ['c2', card(600, 0, 92)], ['a1', card(0, 420)], ['a2', card(246, 420)]]);
+      expect(covering(attachLinks(boxes, cables))).toEqual([]);
+    });
+
+    it('whichever end of a cable is named first, and whatever order the cables come in', () => {
+      const boxes = new Map<string, Box>([['c1', card(0, 0, 92)], ['c2', card(360, 0, 92)], ['a1', card(0, 420)], ['a2', card(360, 420)]]);
+      const turned = cables.map((c) => (c.source === 'c2' ? { id: c.id, source: c.target, target: c.source } : c));
+      expect(covering(attachLinks(boxes, turned))).toEqual([]);
+      expect(covering(attachLinks(boxes, [...cables].reverse()))).toEqual([]);
+    });
+
+    it('a cable too short to step aside, or with no lane left before its far end, stays where it was', () => {
+      // The rows are so close that no lane is free below the first cable's run.
+      const tight = new Map<string, Box>([['c1', card(120, 0, 92)], ['c2', card(600, 0, 92)], ['a1', card(0, 130)], ['a2', card(246, 130)]]);
+      const lanes = attachLinks(tight, cables, true);
+      const at = attachLinks(tight, cables);
+      for (const id of ['c2a1', 'c2a2']) {
+        const turn = at.get(id)!.turn ?? 0;
+        expect(turn === lanes.get(id)!.turn || (turn > 92 && turn <= 120)).toBe(true);
+      }
+    });
+
+    it('leaves the cables of a plain tree where they were', () => {
+      const boxes = new Map<string, Box>([['r', card(300, 0)], ['x', card(0, 300)], ['y', card(300, 300)], ['z', card(600, 300)], ['x1', card(-130, 600)], ['x2', card(130, 600)]]);
+      const tree = [['r', 'x'], ['r', 'y'], ['r', 'z'], ['x', 'x1'], ['x', 'x2']].map(([source, target]) => ({ id: `${source}${target}`, source: source as string, target: target as string }));
+      const at = attachLinks(boxes, tree);
+      expect(covering(at)).toEqual([]);
+      expect([...at.values()].map((a) => [a.sx, a.tx, a.turn].map((v) => Math.round((v ?? 0) * 10) / 10))).toEqual([[350.4, 108, 118], [408, 408, 96], [465.6, 708, 74], [64.8, -22, 396], [151.2, 238, 374]]);
+    });
+  });
+
   it('sends the outermost of many downward links out of the left and right sides', () => {
     const boxes = new Map<string, Box>([['sw', sw]]);
     const xs = [-500, -250, 0, 400, 700, 1000, 1250];
@@ -274,6 +349,23 @@ describe('placeCableLabels', () => {
     expect(clear(src, port, m, mid)).toBe(true);
     expect(clear(dst, port, m, mid)).toBe(true);
     expect([src.y, dst.y, m.y]).toEqual([0, 0, 0]);
+  });
+
+  it('keeps the middle label on its cable, further along it, when the middle is taken', () => {
+    const onLine = (m?: { x: number; y: number }) => m?.x === 0;
+    // The label of another cable lies across the middle; the cable has room above and below it.
+    const other = [{ x: 0, y: 190, w: 1, h: 20 }];
+    const p = placeCableLabels(400, vertical, { src: port, dst: port, mid }, other);
+    expect(onLine(p.mid)).toBe(true);
+    expect(clear(p.mid as { x: number; y: number }, mid, { x: 0.5, y: 200 }, { w: 1, h: 20 })).toBe(true);
+    // A wide label of its own near the middle: the middle label moves along the cable, not beside it.
+    const wide = { w: 60, h: 150 };
+    const q = placeCableLabels(400, vertical, { src: wide, mid });
+    expect(onLine(q.mid)).toBe(true);
+    expect(clear(q.mid as { x: number; y: number }, mid, q.src as { x: number; y: number }, wide)).toBe(true);
+    // Nowhere on the cable is free: only then it stands beside the line.
+    const full = placeCableLabels(400, vertical, { mid }, [{ x: 0, y: 0, w: 1, h: 400 }]);
+    expect(onLine(full.mid)).toBe(false);
   });
 
   it('reads points whose coordinates live on the prototype, as browser points do', () => {

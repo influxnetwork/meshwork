@@ -1,6 +1,6 @@
 import { deviceDetailsText, reportedIdentity, type DeviceDetailsInput } from '@shared/device-details';
 import { parseDeviceModel } from '@shared/model';
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import {
   ArrowDown,
   ArrowUp,
@@ -20,7 +20,7 @@ import {
   X,
 } from 'lucide-react';
 import type { Asset, DeviceType, PingResult } from '@shared/types';
-import type { ConnectionRow, NodeFacts } from './map-model';
+import type { ConnectionRow, NodeFacts, SharedGateway } from './map-model';
 import { cleanError, useStore } from './store';
 import { NetworkStrip } from './Networks';
 import { Copyable, DeviceTile, EmptyState, V6Pill, PortChips, SeverityBadge, displayName, relativeTime, topSeverity, typeLabel } from './ui';
@@ -376,6 +376,8 @@ export interface GearFacts {
   type?: DeviceType;
   description?: string;
   source: 'snmp' | 'lldp' | 'cdp';
+  /** Gateway addresses the device shares with other routers and holds. */
+  gateways?: SharedGateway[];
 }
 
 /** Model, firmware, announced name and full description from SNMP, LLDP or CDP. */
@@ -406,6 +408,19 @@ export function GearRows({ gear }: { gear: GearFacts }) {
           </dd>
         </>
       )}
+      {gear.gateways?.map((g) => (
+        <Fragment key={g.ip}>
+          <dt>Shared gateway</dt>
+          <dd title={g.active ? 'The last reading shows this device answering for the address.' : 'Which of the routers answers for the address was not read.'}>
+            <Copyable value={g.ip} label="gateway address" mono />{' '}
+            <span className="muted">
+              · {g.protocol}
+              {g.vlan !== undefined ? ` · VLAN ${g.vlan}` : ''} · {g.network}
+              {g.active ? ' · active' : ''}
+            </span>
+          </dd>
+        </Fragment>
+      ))}
       {gear.description && (
         <>
           <dt>Description</dt>

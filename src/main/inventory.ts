@@ -125,6 +125,8 @@ const MIGRATIONS: Migration[] = [
      collected_at  text not null,
      data          text not null
    );`,
+  // v5: ranges scanned into a network besides the one that names it.
+  'alter table networks add column also_scanned text;',
 ];
 
 interface AssetRow {
@@ -155,10 +157,16 @@ interface NetworkRow {
   name: string;
   fingerprint: string;
   cidr: string;
+  also_scanned: string | null;
   gateway_ip: string | null;
   gateway_mac: string | null;
   created_at: string;
   last_scan_at: string;
+}
+
+/** The ranges of a comma-separated list, trimmed, without empty ones. */
+function splitRanges(text: string | null): string[] {
+  return (text ?? '').split(',').map((r) => r.trim()).filter(Boolean);
 }
 
 function keyFor(host: DiscoveredHost): string {
@@ -184,6 +192,7 @@ function toNetwork(row: NetworkRow): Network {
     name: row.name,
     fingerprint: row.fingerprint,
     cidr: row.cidr,
+    alsoScanned: row.also_scanned ?? undefined,
     gatewayIp: row.gateway_ip ?? undefined,
     gatewayMac: row.gateway_mac ?? undefined,
     createdAt: row.created_at,
@@ -288,14 +297,31 @@ export class Inventory {
     if (!row) return undefined;
     const now = new Date().toISOString();
     if (row.fingerprint.startsWith('range:')) {
-      const have = row.cidr.split(',').map((r) => r.trim()).filter(Boolean);
-      const added = ranges.split(',').map((r) => r.trim()).filter((r) => r && !have.includes(r));
+      const have = splitRanges(row.cidr);
+      const added = [...new Set(splitRanges(ranges))].filter((r) => !have.includes(r));
       const cidr = [...have, ...added].join(', ');
       const fingerprint = `range:${cidr}`;
       const taken = added.length ? this.networkRow('select * from networks where fingerprint = ? and id <> ?', fingerprint, id) : undefined;
       if (added.length && !taken) this.db.prepare('update networks set cidr = ?, fingerprint = ? where id = ?').run(cidr, fingerprint, id);
     }
     this.db.prepare('update networks set last_scan_at = ? where id = ?').run(now, id);
+    return toNetwork(this.networkRow('select * from networks where id = ?', id) as NetworkRow);
+  }
+
+  /**
+   * Remembers the ranges a finished scan covered in a network known by its router, besides the
+   * subnet that names it. A network known by its ranges holds them all in those ranges already,
+   * and is returned as it is. Undefined when the network does not exist.
+   */
+  rememberScanned(id: string, ranges: string): Network | undefined {
+    const row = this.networkRow('select * from networks where id = ?', id);
+    if (!row) return undefined;
+    if (!row.fingerprint.startsWith('range:')) {
+      const kept = splitRanges(row.also_scanned);
+      const have = [...splitRanges(row.cidr), ...kept];
+      const added = [...new Set(splitRanges(ranges))].filter((r) => !have.includes(r));
+      if (added.length) this.db.prepare('update networks set also_scanned = ? where id = ?').run([...kept, ...added].join(', '), id);
+    }
     return toNetwork(this.networkRow('select * from networks where id = ?', id) as NetworkRow);
   }
 
@@ -325,11 +351,13 @@ export class Inventory {
   /**
    * Inserts or updates the asset for a host seen in `runId` on `networkId`. Within a run, later
    * events carry more complete data and replace earlier ones. A host first seen without a MAC is
-   * re-keyed when its MAC becomes known.
+   * re-keyed when a scan sees its MAC. A MAC kept from an earlier reading does not re-key it:
+   * several addresses of one device, or a device found at a new address, carry the same MAC.
    */
   upsert(host: DiscoveredHost, runId: string, networkId: string): Asset {
     const now = new Date().toISOString();
     const key = keyFor(host);
+    const seenMac = !!host.mac;
     let row = this.row('select * from assets where network_id = ? and key = ?', networkId, key);
     if (!row && host.mac) row = this.row('select * from assets where network_id = ? and key = ?', networkId, `ip:${host.ip}`);
     if (!row && !host.mac)
@@ -355,7 +383,7 @@ export class Inventory {
     }
     const data = JSON.stringify(host);
     if (row) {
-      const newKey = host.mac ? keyFor(host) : row.key;
+      const newKey = seenMac ? key : row.key;
       this.db
         .prepare('update assets set key = ?, ip = ?, mac = coalesce(?, mac), data = ?, last_seen = ?, last_run_id = ? where id = ?')
         .run(newKey, host.ip, host.mac ?? null, data, now, runId, row.id);

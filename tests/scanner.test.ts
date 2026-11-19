@@ -8,7 +8,7 @@ import { countAddresses, describeTargets, expandRanges, intToIp, ipToInt, parseT
 import { parsePortList, serviceName, TOP_PORTS } from '../src/scanner/ports';
 import { tcpProbe, buildNbstatQuery, normalizeMac, parseArp, parseNbstat, parseNbstatReply, parsePingOutput, parsePingSeries, parseNdp, parseNetshNeighbors6, ipv6Scope, addressesByMac } from '../src/scanner/probes';
 import { classify, evaluateRisks, VendorDb } from '../src/scanner/analysis';
-import { countPortChecks, identifyInterfaces, macGaps, MIN_PORT_WAIT_MS, networkIdentity, parseDefaultGateways, PortWait, portChecks, subnetOf } from '../src/scanner/engine';
+import { countPortChecks, identifyInterfaces, macGaps, MIN_PORT_WAIT_MS, networkIdentity, parseDefaultGateways, PortWait, portChecks, silentAddresses, subnetOf, subnetsInTable } from '../src/scanner/engine';
 import { compareVersions, parseCsv, parseIeeeCsv } from '../src/main/vendor-format';
 import { assetsToCsv, defaultNetworkName, Inventory, sortByIp } from '../src/main/inventory';
 import { fromHelper, generationOf, netshNeedsLocation, parseNetshInterface, parseNetshNetworks, percentToDbm } from '../src/main/wifi-format';
@@ -46,6 +46,16 @@ describe('targets', () => {
     expect(() => parseToken('10.0.0.50-10.0.0.1')).toThrow();
     expect(describeTargets('10.0.0.0/8').tooLarge).toBe(true);
     expect(describeTargets('10.0.0.0/16').tooLarge).toBe(false);
+  });
+
+  it('names the target that makes a scan too large, with how many addresses it has', () => {
+    // One mistyped prefix among good targets.
+    const { largest } = describeTargets('172.20.0.0/24; 172.20.255.0/2; 172.20.10.0/24');
+    expect(largest?.target).toBe('172.20.255.0/2');
+    expect(largest?.count).toBeGreaterThan(1_000_000_000);
+    // Targets that are too many only together: none stands out.
+    expect(describeTargets('10.0.0.0/17; 10.1.0.0/17; 10.2.0.0/17').largest).toBeUndefined();
+    expect(describeTargets('10.0.0.0/24').largest).toBeUndefined();
   });
 });
 
@@ -399,6 +409,30 @@ describe('inventory', () => {
     inv.close();
   });
 
+  it('scans again devices that share a MAC address read over SNMP, and one that moved to another address', () => {
+    const inv = db();
+    const remote = inv.resolveNetwork({ fingerprint: 'range:198.51.100.0/24, 203.0.113.0/24', cidr: '198.51.100.0/24, 203.0.113.0/24', local: false }).id;
+    // A layer 3 switch answers on one address per VLAN, all with the same MAC address.
+    const shared = 'aa:bb:cc:00:00:02';
+    const one = inv.upsert(host({ ip: '198.51.100.2' }), 'run-1', remote);
+    const two = inv.upsert(host({ ip: '203.0.113.2' }), 'run-1', remote);
+    expect(inv.fillMacs(remote, [{ ip: '198.51.100.2', mac: shared }, { ip: '203.0.113.2', mac: shared }])).toBe(2);
+    for (const run of ['run-2', 'run-3']) {
+      expect(inv.upsert(host({ ip: '198.51.100.2' }), run, remote)).toMatchObject({ id: one.id, mac: shared });
+      expect(inv.upsert(host({ ip: '203.0.113.2' }), run, remote)).toMatchObject({ id: two.id, mac: shared });
+    }
+    // A computer read at one address, scanned twice, then found at another address with the same MAC address.
+    const moved = 'aa:bb:cc:00:00:11';
+    const before = inv.upsert(host({ ip: '198.51.100.11' }), 'run-3', remote);
+    inv.fillMacs(remote, [{ ip: '198.51.100.11', mac: moved }]);
+    inv.upsert(host({ ip: '198.51.100.11' }), 'run-4', remote);
+    const after = inv.upsert(host({ ip: '203.0.113.11' }), 'run-5', remote);
+    inv.fillMacs(remote, [{ ip: '203.0.113.11', mac: moved }]);
+    expect(inv.upsert(host({ ip: '203.0.113.11' }), 'run-6', remote)).toMatchObject({ id: after.id, ip: '203.0.113.11', mac: moved });
+    expect(inv.get([before.id])[0]).toMatchObject({ ip: '198.51.100.11' });
+    inv.close();
+  });
+
   it('removes one scan from the history and keeps the rest and the devices', () => {
     const inv = db();
     const net = inv.resolveNetwork(home).id;
@@ -523,6 +557,25 @@ describe('inventory', () => {
     inv.close();
   });
 
+  it('remembers the ranges scanned into a network known by its router, apart from the network itself', () => {
+    const inv = db();
+    const local = inv.resolveNetwork(home);
+    expect(local.alsoScanned).toBeUndefined();
+    // A scan run into the network leaves no trace until it is known to have finished.
+    expect(inv.extendNetwork(local.id, '10.0.5.0/24')?.alsoScanned).toBeUndefined();
+    expect(inv.rememberScanned(local.id, ' 10.0.5.0/24 ')).toMatchObject({ cidr: home.cidr, fingerprint: home.fingerprint, alsoScanned: '10.0.5.0/24' });
+    // A range given twice, or the subnet that names the network, changes nothing; a new one joins the list.
+    expect(inv.rememberScanned(local.id, `10.0.5.0/24, ${home.cidr}, 10.0.9.1-10.0.9.254, 10.0.9.1-10.0.9.254`)?.alsoScanned).toBe('10.0.5.0/24, 10.0.9.1-10.0.9.254');
+    // A later scan of the network itself keeps them, and so does the list of networks.
+    expect(inv.resolveNetwork(home)).toMatchObject({ id: local.id, alsoScanned: '10.0.5.0/24, 10.0.9.1-10.0.9.254' });
+    expect(inv.networks().find((n) => n.id === local.id)?.alsoScanned).toBe('10.0.5.0/24, 10.0.9.1-10.0.9.254');
+    // A network known by its ranges keeps them all in the ranges that name it.
+    const remote = inv.resolveNetwork({ fingerprint: 'range:198.51.100.0/24', cidr: '198.51.100.0/24', local: false });
+    expect(inv.rememberScanned(remote.id, '203.0.113.0/30')?.alsoScanned).toBeUndefined();
+    expect(inv.rememberScanned('missing', '203.0.113.0/30')).toBeUndefined();
+    inv.close();
+  });
+
   it('adopts a subnet-only network once its router is identified, and renames and removes networks', () => {
     const inv = db();
     const first = inv.resolveNetwork({ fingerprint: 'subnet:192.0.2.0/24', cidr: '192.0.2.0/24', local: true });
@@ -574,6 +627,8 @@ describe('inventory', () => {
     expect(inv.runs().find((r) => r.runId === 'r2')?.networkId).toBe(byName['192.168.0.0/23']);
     // A later scan of the same subnet with the router identified joins the migrated network.
     expect(inv.resolveNetwork({ ...home, cidr: '10.0.0.0/24' }).id).toBe(byName['10.0.0.0/24']);
+    // The upgraded inventory remembers ranges scanned into a network.
+    expect(inv.rememberScanned(byName['10.0.0.0/24'] as string, '10.0.5.0/24')?.alsoScanned).toBe('10.0.5.0/24');
     inv.close();
   });
 
@@ -700,6 +755,25 @@ describe('MAC recovery pass', () => {
     const own = new Map([['10.0.0.50', 'aa:aa:aa:aa:aa:aa']]);
     const hosts = [host('10.0.0.191'), host('10.0.0.1', 'bc:24:11:00:00:01'), host('10.0.0.50'), host('192.168.5.9')];
     expect(macGaps(hosts, '10.0.0.0/24', own).map((h) => h.ip)).toEqual(['10.0.0.191']);
+  });
+
+  it('looks a second time at silent addresses next to one that answered, where no neighbour table was read', () => {
+    const addresses = ['10.0.0.5', '10.0.0.6', '172.20.0.4', '172.20.0.5', '172.20.0.6', '172.20.9.1', '172.20.9.2'];
+    const live = new Set(['10.0.0.5', '172.20.0.5']);
+    // The neighbour table of 10.0.0.0/24 was read: it already told who is there. Nothing answered in 172.20.9.x.
+    expect(silentAddresses(addresses, live, ['10.0.0.0/24'])).toEqual(['172.20.0.4', '172.20.0.6']);
+    // No neighbour table was read (ranges this computer is on none of, or the system withheld it).
+    expect(silentAddresses(addresses, live, [])).toEqual(['10.0.0.6', '172.20.0.4', '172.20.0.6']);
+    expect(silentAddresses(addresses, new Set(addresses), [])).toEqual([]);
+    expect(silentAddresses(addresses, new Set(), [])).toEqual([]);
+  });
+
+  it('takes a subnet as told by the neighbour table only when the table holds an address of it', () => {
+    const table = new Map([['10.0.0.1', 'aa:aa:aa:aa:aa:01'], ['100.64.0.9', 'aa:aa:aa:aa:aa:02']]);
+    expect(subnetsInTable(['10.0.0.0/24', '192.168.7.0/24'], table)).toEqual(['10.0.0.0/24']);
+    // A table the system withheld, or that holds only other networks, tells nothing.
+    expect(subnetsInTable(['10.0.0.0/24'], new Map())).toEqual([]);
+    expect(subnetsInTable(['192.168.7.0/24'], table)).toEqual([]);
   });
 });
 

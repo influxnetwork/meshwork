@@ -35,6 +35,24 @@ describe('one reading per device', () => {
     expect(uniqueGear([reading('10.0.0.2', 'SW', ['10.0.0.2', '192.168.1.1']), reading('192.168.1.1', 'EDGE')])).toHaveLength(2);
   });
 
+  it('keeps one reading of a router that also answered on the network and broadcast addresses of its links', () => {
+    // Two /30 links: .3 is the broadcast address of the first and .4 the network address of the second.
+    const links = ['10.0.0.130', '172.20.255.1', '172.20.255.5'];
+    const out = uniqueGear([reading('172.20.255.4', 'R1', links), reading('172.20.255.3', 'R1', links), reading('172.20.255.6', 'CORE2', ['172.20.255.6']), reading('172.20.255.5', 'R1', links)]);
+    // The first reading is kept, under the address of its own that a later reading was taken on.
+    expect(out.map((d) => d.ip)).toEqual(['172.20.255.5', '172.20.255.6']);
+    const fresh = { ...reading('172.20.255.4', 'R1', links), sysDescr: 'fresh' };
+    expect(uniqueGear([fresh, { ...reading('172.20.255.1', 'R1', links), sysDescr: 'stored' }])).toMatchObject([{ ip: '172.20.255.1', sysDescr: 'fresh' }]);
+    expect(uniqueGear([reading('172.20.255.5', 'R1', links), reading('172.20.255.3', 'R1', links)]).map((d) => d.ip)).toEqual(['172.20.255.5']);
+    // With no reading on an address of its own, the first one stands.
+    expect(uniqueGear([reading('172.20.255.4', 'R1', links), reading('172.20.255.3', 'R1', links)]).map((d) => d.ip)).toEqual(['172.20.255.4']);
+  });
+
+  it('keeps two devices that list the same addresses under different names', () => {
+    const shared = ['192.168.1.1'];
+    expect(uniqueGear([reading('10.0.0.2', 'A', shared), reading('10.0.0.3', 'B', shared)])).toHaveLength(2);
+  });
+
   it('ignores placeholder addresses when matching', () => {
     const out = uniqueGear([reading('10.0.0.2', 'A', ['0.0.0.0', '127.0.0.1', '10.0.0.2']), reading('10.0.0.3', 'B', ['0.0.0.0', '127.0.0.1', '10.0.0.3'])]);
     expect(out).toHaveLength(2);

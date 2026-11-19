@@ -107,7 +107,19 @@ export function parseTargets(text: string): { ranges: Ipv4Range[]; errors: strin
 export function describeTargets(text: string): TargetParseResult {
   const { ranges, errors } = parseTargets(text);
   const count = countAddresses(ranges);
-  return { count, errors, tooLarge: count > MAX_TARGETS };
+  let largest: TargetParseResult['largest'];
+  if (count > MAX_TARGETS) {
+    for (const target of splitTargets(text)) {
+      try {
+        const r = parseToken(target);
+        const size = r.end - r.start + 1;
+        if (size > MAX_TARGETS && size > (largest?.count ?? 0)) largest = { target, count: size };
+      } catch {
+        // A target that does not parse is already in `errors`.
+      }
+    }
+  }
+  return { count, errors, tooLarge: count > MAX_TARGETS, largest };
 }
 
 export function* expandRanges(ranges: Ipv4Range[]): Generator<string> {

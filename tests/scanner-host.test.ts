@@ -91,6 +91,38 @@ describe('scanner host', () => {
     expect(inventory.networks()).toEqual([]);
   });
 
+  it('remembers the range of a scan run into a network when it finishes, not when it is cancelled or fails', () => {
+    const { inventory, scanner, sent, runId, emit, networkId } = setup();
+    emit({ type: 'host', runId, host: host('192.0.2.10') });
+    emit({ type: 'done', summary: summary(runId, 'done', 1) });
+    const scanned = () => inventory.networks().find((n) => n.id === networkId)?.alsoScanned;
+    /** A scan of another range run into the network, up to the point where the network is known. */
+    const into = (ranges: string) => {
+      const id = scanner.start({ targets: ranges, intoNetwork: networkId } as never);
+      const send = (event: ScanEvent) => children.at(-1)!.emit('message', event);
+      send({ type: 'network-identity', runId: id, identity: { fingerprint: `range:${ranges}`, cidr: ranges, local: false } } as ScanEvent);
+      return { id, send };
+    };
+
+    const cancelled = into('10.0.5.0/24');
+    expect(scanned()).toBeUndefined();
+    cancelled.send({ type: 'done', summary: summary(cancelled.id, 'cancelled', 0) });
+    expect(scanned()).toBeUndefined();
+
+    const failed = into('10.0.5.0/24');
+    failed.send({ type: 'error', runId: failed.id, message: 'stopped' } as ScanEvent);
+    expect(scanned()).toBeUndefined();
+
+    const finished = into('10.0.5.0/24');
+    const before = sent.length;
+    finished.send({ type: 'done', summary: summary(finished.id, 'done', 0) });
+    expect(scanned()).toBe('10.0.5.0/24');
+    // The network as it now is reaches the window before the end of the scan does.
+    expect(sent.slice(before).map((e) => e.type)).toEqual(['network', 'done']);
+    expect(sent.slice(before)[0]).toMatchObject({ network: { id: networkId, alsoScanned: '10.0.5.0/24' } });
+    expect(inventory.networks()).toHaveLength(1);
+  });
+
   it('leaves a scan running when another network is deleted', () => {
     const { inventory, scanner, runId, child, emit } = setup();
     const other = inventory.resolveNetwork({ fingerprint: 'range:198.51.100.0/24', cidr: '198.51.100.0/24', local: false });

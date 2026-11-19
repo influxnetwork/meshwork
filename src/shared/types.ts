@@ -123,6 +123,12 @@ export interface Network {
   name: string;
   fingerprint: string;
   cidr: string;
+  /**
+   * Ranges scanned into the network besides `cidr`, comma-separated: for a network known by its
+   * router, whose `cidr` is the subnet that names it. A network known by its ranges keeps them
+   * all in `cidr`.
+   */
+  alsoScanned?: string;
   gatewayIp?: string;
   gatewayMac?: string;
   createdAt: string; // ISO 8601 UTC
@@ -270,6 +276,8 @@ export interface GearInterface {
   stp?: StpState;
   /** Duplex the port negotiated (EtherLike-MIB), when the device reports it. */
   duplex?: Duplex;
+  /** Interface index of the link bundle (LACP or static) this port is one of the cables of. */
+  memberOf?: number;
 }
 
 export type Duplex = 'half' | 'full';
@@ -337,8 +345,11 @@ export interface GearDevice {
   arp: { ip: string; mac: string }[];
   /** VLANs configured on the device (802.1Q); ports carry their membership. */
   vlans?: GearVlan[];
-  /** The device's own IPv4 addresses and the interface each one is on (routers: one per network). */
-  addresses?: { ip: string; prefix: number; ifIndex: number }[];
+  /**
+   * The device's own IPv4 addresses and the interface each one is on (routers: one per network).
+   * `assumed`: the device did not report the address; it was given to it for want of a better holder.
+   */
+  addresses?: { ip: string; prefix: number; ifIndex: number; assumed?: boolean }[];
   /** True when the device routes traffic between networks (IP forwarding on). */
   forwarding?: boolean;
   /** Number of bridge ports it reports: it switches frames, even when its MAC table reads empty. */
@@ -379,6 +390,8 @@ export interface TargetParseResult {
   count: number;
   errors: string[];
   tooLarge: boolean;
+  /** The target that alone has more addresses than one scan takes: the largest such, as it was typed. */
+  largest?: { target: string; count: number };
 }
 
 export interface PingReply {

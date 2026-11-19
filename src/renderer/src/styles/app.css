@@ -543,6 +543,11 @@ table.data-table.wifi-table td { padding-top: 5px; padding-bottom: 5px; }
 .map-legend .line.tunnel { border-top: 0; height: 2px; background: repeating-linear-gradient(90deg, var(--text-muted) 0 8px, transparent 8px 11px, var(--text-muted) 11px 13px, transparent 13px 16px); }
 .map-node.device.routes { height: 74px; }
 .map-node.gateway.routes { height: 82px; }
+.map-node.device.shared { height: 70px; }
+.map-node.gateway.shared { height: 78px; }
+.map-node.device.routes.shared { height: 92px; }
+.map-node.gateway.routes.shared { height: 100px; }
+.map-text .map-shared { margin-top: 3px; font-size: 10.5px; color: var(--text-muted); }
 .map-routes { display: flex; align-items: center; gap: 3px; margin-top: 4px; font-size: 10.5px; color: var(--text-muted); white-space: nowrap; overflow: hidden; }
 .map-routes > span { margin-right: 2px; }
 .map-route { display: inline-flex; align-items: center; justify-content: center; min-width: 22px; height: 17px; padding: 0 5px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--vlan) 70%, transparent); background: color-mix(in srgb, var(--vlan) 16%, var(--surface)); color: var(--text); font-family: inherit; font-size: 10.5px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; cursor: pointer; }
@@ -587,6 +592,8 @@ table.data-table.wifi-table td { padding-top: 5px; padding-bottom: 5px; }
 .map-node.self, .map-member.self { border-color: var(--success, #16a34a); }
 .map-member.self { position: relative; }
 .map-managed { position: absolute; top: -9px; left: 12px; padding: 0 6px; height: 16px; line-height: 16px; border-radius: 8px; background: var(--accent); color: #fff; font-size: 9.5px; font-weight: 700; letter-spacing: .04em; }
+.map-loop-mark { position: absolute; top: -9px; left: 58px; display: inline-flex; align-items: center; gap: 3px; padding: 0 7px 0 5px; height: 16px; border-radius: 8px; background: var(--warning); color: #3d2a00; font-size: 9.5px; font-weight: 700; letter-spacing: .04em; cursor: help; pointer-events: auto; }
+.map-loop-mark .icon { width: 10px; height: 10px; }
 .map-port-badge { margin-left: auto; flex: none; display: inline-flex; align-items: center; gap: 2px; padding: 1px 5px; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--border); font-size: 10px; font-family: var(--font-mono, ui-monospace, monospace); color: var(--text-2); }
 .map-port-badge.poe { border-color: color-mix(in srgb, var(--warning) 60%, transparent); color: var(--warning-text); background: color-mix(in srgb, var(--warning) 10%, var(--surface)); }
 .map-port-badge .icon { width: 10px; height: 10px; }
